@@ -14,6 +14,7 @@ class UpdateUser(BaseModel):
     username: Optional[str] = None
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    banner_url: Optional[str] = None
 
 
 def format_user(user: User):
@@ -25,6 +26,7 @@ def format_user(user: User):
         "display_name": user.display_name,
         "bio": user.bio,
         "avatar_url": user.avatar_url,
+        "banner_url": user.banner_url,
         "reputation": user.reputation,
         "total_earned": float(user.total_earned) if user.total_earned is not None else 0.0,
         "is_verified": user.is_verified,
@@ -82,6 +84,9 @@ def update_user(
         user.display_name = updates.display_name
     if updates.avatar_url is not None:
         user.avatar_url = updates.avatar_url
+    if updates.banner_url is not None:
+        user.banner_url = updates.banner_url
+
 
     db.commit()
     db.refresh(user)

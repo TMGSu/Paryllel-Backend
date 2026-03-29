@@ -12,6 +12,7 @@ class Post(Base):
     community_id = Column(UUID(as_uuid=True), ForeignKey("communities.id", ondelete="CASCADE"), nullable=False)
 
     title = Column(String, nullable=False)
+    slug = Column(String, unique=True, nullable=True, index=True)
     body = Column(Text, nullable=True)
     post_type = Column(String, nullable=False, server_default=text("'text'"))  # text | image | video | link
 

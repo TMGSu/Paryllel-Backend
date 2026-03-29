@@ -12,8 +12,28 @@ from app.models.community import Community
 from app.models.user import User
 from app.models.vote import Vote
 from app.models.media import Media
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+import re
 
 router = APIRouter(prefix="/posts", tags=["posts"])
+
+
+def generate_slug(title: str, post_id: str, db) -> str:
+    slug = title.lower().strip()
+    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+    slug = re.sub(r'[\s]+', '-', slug)
+    slug = re.sub(r'-+', '-', slug).strip('-')
+    slug = slug[:80]
+
+    # Check if slug already exists
+    existing = db.query(Post).filter(Post.slug == slug).first()
+    if existing:
+        # Only add suffix if there's a conflict
+        short_id = str(post_id)[:8]
+        slug = f"{slug}-{short_id}"
+
+    return slug
 
 
 class CreatePost(BaseModel):
@@ -31,6 +51,7 @@ class CreatePost(BaseModel):
 def format_post(post: Post, current_user_id=None, db: Session = None):
     result = {
         "id": str(post.id),
+        "slug": post.slug,
         "title": post.title,
         "body": post.body,
         "post_type": post.post_type,
@@ -72,13 +93,17 @@ def format_post(post: Post, current_user_id=None, db: Session = None):
     return result
 
 
+
+optional_security = HTTPBearer(auto_error=False)
+
 @router.get("/")
 def list_posts(
     community: Optional[str] = Query(None),
-    sort: str = Query("hot"),  # hot | new | top
+    sort: str = Query("hot"),
     limit: int = Query(20),
     offset: int = Query(0),
     db: Session = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
 ):
     query = db.query(Post).filter(Post.is_removed == False)
 
@@ -91,20 +116,28 @@ def list_posts(
         query = query.order_by(desc(Post.created_at))
     elif sort == "top":
         query = query.order_by(desc(Post.upvotes - Post.downvotes))
-    else:  # hot — score + recency
+    else:
         query = query.order_by(desc(Post.upvotes - Post.downvotes), desc(Post.created_at))
 
     posts = query.offset(offset).limit(limit).all()
-    return {"posts": [format_post(p) for p in posts], "total": query.count()}
 
+    # Try to get current user for vote state
+    current_user = None
+    if credentials:
+        try:
+            from jwt import PyJWKClient
+            import jwt, os
+            jwk_client = PyJWKClient(f"https://{os.getenv('CLERK_FRONTEND_API')}/.well-known/jwks.json")
+            signing_key = jwk_client.get_signing_key_from_jwt(credentials.credentials)
+            payload = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"])
+            current_user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+        except Exception:
+            pass
 
-@router.get("/{post_id}")
-def get_post(post_id: str, db: Session = Depends(get_db)):
-    post = db.query(Post).filter(Post.id == post_id, Post.is_removed == False).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return format_post(post)
-
+    return {
+        "posts": [format_post(p, current_user_id=current_user.id if current_user else None, db=db) for p in posts],
+        "total": query.count()
+    }
 
 @router.post("/")
 def create_post(
@@ -140,6 +173,9 @@ def create_post(
     db.add(post)
     db.flush()
 
+    post.slug = generate_slug(body.title.strip(), str(post.id), db)
+
+
     # Add media records
     for i, url in enumerate(body.media_urls or []):
         media_type = "video" if any(url.endswith(ext) for ext in [".mp4", ".webm", ".mov"]) else "image"
@@ -160,6 +196,21 @@ def create_post(
     db.commit()
 
     return {"message": "Post created", "post": format_post(post)}
+
+@router.get("/slug/{slug}")
+def get_post_by_slug(slug: str, db: Session = Depends(get_db)):
+    post = db.query(Post).filter(Post.slug == slug, Post.is_removed == False).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return format_post(post)
+
+
+@router.get("/{post_id}")
+def get_post(post_id: str, db: Session = Depends(get_db)):
+    post = db.query(Post).filter(Post.id == post_id, Post.is_removed == False).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return format_post(post)
 
 
 @router.delete("/{post_id}")
@@ -188,7 +239,7 @@ def delete_post(
 @router.post("/{post_id}/vote")
 def vote_post(
     post_id: str,
-    value: int,  # 1 or -1
+    value: int,
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
@@ -208,7 +259,6 @@ def vote_post(
 
     if existing:
         if existing.value == value:
-            # Undo vote
             if value == 1:
                 post.upvotes = max(0, post.upvotes - 1)
             else:
@@ -217,7 +267,6 @@ def vote_post(
             db.commit()
             return {"message": "Vote removed"}
         else:
-            # Change vote
             if value == 1:
                 post.upvotes += 1
                 post.downvotes = max(0, post.downvotes - 1)
@@ -226,7 +275,6 @@ def vote_post(
                 post.upvotes = max(0, post.upvotes - 1)
             existing.value = value
     else:
-        # New vote
         vote = Vote(user_id=user.id, post_id=post.id, value=value)
         db.add(vote)
         if value == 1:

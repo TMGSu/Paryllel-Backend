@@ -46,6 +46,57 @@ async def upload_image(
     return {"url": url}
 
 
+@router.post("/banner")
+async def upload_banner(
+    file: UploadFile = File(...),
+    payload: dict = Depends(verify_token),
+):
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF allowed")
+
+    data = await file.read()
+
+    if len(data) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail="Image must be under 10MB")
+
+    url = upload_file(data, file.content_type, folder="banners")
+    return {"url": url}
+
+
+@router.post("/community-icon")
+async def upload_community_icon(
+    file: UploadFile = File(...),
+    payload: dict = Depends(verify_token),
+):
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF allowed")
+
+    data = await file.read()
+
+    if len(data) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail="Image must be under 10MB")
+
+    url = upload_file(data, file.content_type, folder="community/icons")
+    return {"url": url}
+
+
+@router.post("/community-banner")
+async def upload_community_banner(
+    file: UploadFile = File(...),
+    payload: dict = Depends(verify_token),
+):
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, or GIF allowed")
+
+    data = await file.read()
+
+    if len(data) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail="Image must be under 10MB")
+
+    url = upload_file(data, file.content_type, folder="community/banners")
+    return {"url": url}
+
+
 @router.post("/video")
 async def upload_video(
     file: UploadFile = File(...),
