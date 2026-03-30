@@ -8,8 +8,9 @@ from app.api.routes.widgets import router as widgets_router
 from app.api.routes.moderation import router as moderation_router
 from app.api.routes.admin import router as admin_router
 from app.api.routes.tips import router as tips_router
-from app.api.routes.admin_withdrawals import router as admin_withdrawals_router
-from app.api.routes.stripe_webhook import router as stripe_webhook_router
+from app.api.routes.webhook import router as stripe_webhook_router
+from app.api.routes.payouts import router as payouts_router
+
 
 all_routers = [
     users_router,
@@ -22,6 +23,6 @@ all_routers = [
     moderation_router,
     admin_router,
     tips_router,
-    admin_withdrawals_router,
+    payouts_router,
     stripe_webhook_router,
 ]

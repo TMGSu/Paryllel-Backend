@@ -1,135 +1,137 @@
-import math
-import os
 import stripe
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from pydantic import BaseModel
-
+from app.core.config import settings
 from app.core.deps import get_db
 from app.core.auth import verify_token
-from app.models.tip import Tip
 from app.models.post import Post
 from app.models.user import User
-from app.models.wallet import Wallet
-from app.models.withdrawal import WithdrawalRequest
+from app.models.tip import Tip
+from app.services import fee_service, tip_service
 
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-FRONTEND_URL  = os.getenv("FRONTEND_URL", "https://paryllel.com")
+from app.schemas.tips import TipRequest, TipResponse, QuoteResponse
 
-PLATFORM_CUT  = 0.20   # 20% taken at withdrawal, not at tip time
-STRIPE_PCT    = 0.029  # 2.9% + $0.30
-STRIPE_FIXED  = 30     # cents
-
-VALID_PRESET_CENTS = {300, 500, 1000}  # $3, $5, $10
-MIN_CUSTOM_CENTS   = 300
-MAX_CUSTOM_CENTS   = 100_000
-
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tips", tags=["tips"])
+stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
-# ─── Fee math ─────────────────────────────────────────────────────────────────
+# ── Quote ─────────────────────────────────────────────────────────────────────
 
-def compute_gross(chosen_cents: int) -> dict:
-    """
-    Tipper pays chosen amount + Stripe fee only.
-    Paryllel takes 20% at withdrawal time, not here.
+@router.get("/quote", response_model=QuoteResponse)
+def tip_quote(
+    post_id: str,
+    amount_cents: int,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    if not (300 <= amount_cents <= 100_000):
+        raise HTTPException(status_code=400, detail="Amount out of range ($3–$1,000)")
 
-        gross = ceil((chosen + 30) / (1 - 0.029))
-              = ceil((chosen + 30) / 0.971)
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-    Example — tipper picks $3 (300 cents):
-        gross      = ceil(330 / 0.971) = 340 cents ($3.40 charged)
-        stripe_fee = ceil(340 * 0.029) + 30 = 40 cents
-        creator gets 300 cents into wallet
-        Paryllel takes 20% = $0.60 when creator withdraws
-    """
-    divisor     = 1 - STRIPE_PCT
-    gross       = math.ceil((chosen_cents + STRIPE_FIXED) / divisor)
-    stripe_fee  = math.ceil(gross * STRIPE_PCT) + STRIPE_FIXED
-    creator_net = gross - stripe_fee
-    return {
-        "chosen_cents":       chosen_cents,
-        "gross_cents":        gross,
-        "stripe_fee_cents":   stripe_fee,
-        "platform_fee_cents": 0,
-        "creator_net_cents":  creator_net,
-    }
+    author = db.query(User).filter(User.id == post.author_id).first()
+    if not author:
+        raise HTTPException(status_code=404, detail="Author not found")
 
+    fees = fee_service.compute_fees(
+        amount_cents,
+        tip_service.get_creator_fee_pct(author),
+    )
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+    return QuoteResponse(
+        chosen_cents       = fees.chosen_cents,
+        gross_cents        = fees.gross_cents,
+        stripe_fee_cents   = fees.stripe_fee_cents,
+        creator_cents      = fees.creator_cents,
+        platform_fee_cents = fees.platform_target_cents,
+        platform_fee_pct   = fees.platform_fee_pct,
+    )
 
-def get_user(clerk_user_id: str, db: Session) -> User:
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    if not user:
+@router.post("/{post_id}/create-intent")
+def create_tip_intent(
+    post_id: str,
+    body: TipRequest,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    tipper = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not tipper:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
 
+    existing = tip_service.check_idempotency(body.idempotency_key, db)
+    if existing:
+        intent = stripe.PaymentIntent.retrieve(existing.stripe_payment_intent_id)
+        return {"client_secret": intent.client_secret, "gross_cents": existing.gross_amount_cents}
 
-def get_or_create_wallet(user_id, db: Session) -> Wallet:
-    wallet = db.query(Wallet).filter(Wallet.user_id == str(user_id)).first()
-    if not wallet:
-        wallet = Wallet(user_id=str(user_id))
-        db.add(wallet)
-        db.commit()
-        db.refresh(wallet)
-    return wallet
+    post   = db.query(Post).filter(Post.id == post_id).first()
+    author = db.query(User).filter(User.id == post.author_id).first() if post else None
 
+    try:
+        tip_service.validate_tip(post, tipper, body.amount_cents)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-def validate_tip_amount(amount_cents: int):
-    if amount_cents not in VALID_PRESET_CENTS and amount_cents < MIN_CUSTOM_CENTS:
-        raise HTTPException(status_code=400, detail="Minimum tip is $3.00")
-    if amount_cents > MAX_CUSTOM_CENTS:
-        raise HTTPException(status_code=400, detail="Maximum tip is $1,000")
+    if not author or not author.stripe_account_id or not author.stripe_onboarding_complete:
+        raise HTTPException(status_code=402, detail="This creator hasn't set up payouts yet")
 
+    fees = fee_service.compute_fees(body.amount_cents, tip_service.get_creator_fee_pct(author))
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
+    intent = stripe.PaymentIntent.create(
+        amount                 = fees.gross_cents,
+        currency               = "usd",
+        application_fee_amount = fees.application_fee_cents,
+        transfer_data          = {"destination": author.stripe_account_id},
+        metadata               = {
+            "post_id":         post_id,
+            "from_user_id":    str(tipper.id),
+            "to_user_id":      str(author.id),
+            "chosen_cents":    str(body.amount_cents),
+        },
+    )
 
-class TipRequest(BaseModel):
-    amount_cents: int        # preset (300/500/1000) or custom >= 300
-    payment_method_id: str   # Stripe PaymentMethod ID from frontend Elements
+    tip_service.create_tip_record(
+        db                = db,
+        fees              = fees,
+        tipper_id         = tipper.id,
+        author_id         = author.id,
+        post_id           = post.id,
+        payment_intent_id = intent.id,
+        idempotency_key   = body.idempotency_key,
+    )
+    db.commit()
 
+    return {"client_secret": intent.client_secret, "gross_cents": fees.gross_cents}
 
-class WithdrawRequest(BaseModel):
-    amount_cents: int
-
-
-# ─── Quote ────────────────────────────────────────────────────────────────────
-
-@router.get("/quote")
-def tip_quote(amount_cents: int):
-    """
-    Call on amount selection so UI can show:
-      'You pay $X.XX — creator receives $Y.YY'
-    """
-    validate_tip_amount(amount_cents)
-    return compute_gross(amount_cents)
-
-
-# ─── Stripe Connect onboarding ────────────────────────────────────────────────
+# ── Stripe Connect onboarding ─────────────────────────────────────────────────
 
 @router.post("/connect/onboard")
 def start_connect_onboarding(
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    user = get_user(payload["sub"], db)
-    wallet = get_or_create_wallet(user.id, db)
+    user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if not wallet.stripe_account_id:
+    if not user.stripe_account_id:
         account = stripe.Account.create(
-            type="express",
-            metadata={"paryllel_user_id": str(user.id)},
+            type     = "express",
+            metadata = {"paryllel_user_id": str(user.id)},
         )
-        wallet.stripe_account_id = account.id
-        wallet.stripe_onboarding_complete = "false"
+        user.stripe_account_id          = account.id
+        user.stripe_onboarding_complete = False
         db.commit()
 
     account_link = stripe.AccountLink.create(
-        account=wallet.stripe_account_id,
-        refresh_url=f"{FRONTEND_URL}/earnings?onboard=refresh",
-        return_url=f"{FRONTEND_URL}/earnings?onboard=complete",
-        type="account_onboarding",
+        account     = user.stripe_account_id,
+        refresh_url = f"{settings.FRONTEND_URL}/earnings?onboard=refresh",
+        return_url  = f"{settings.FRONTEND_URL}/earnings?onboard=complete",
+        type        = "account_onboarding",
     )
     return {"url": account_link.url}
 
@@ -139,134 +141,106 @@ def connect_status(
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    user = get_user(payload["sub"], db)
-    wallet = get_or_create_wallet(user.id, db)
+    user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if not wallet.stripe_account_id:
+    if not user.stripe_account_id:
         return {"connected": False, "onboarding_complete": False}
 
-    account = stripe.Account.retrieve(wallet.stripe_account_id)
-    complete = account.get("details_submitted", False)
+    account  = stripe.Account.retrieve(user.stripe_account_id)
+    complete = account.details_submitted or False
 
-    if complete and wallet.stripe_onboarding_complete != "true":
-        wallet.stripe_onboarding_complete = "true"
+    if complete and not user.stripe_onboarding_complete:
+        user.stripe_onboarding_complete = True
         db.commit()
 
     return {
-        "connected": True,
+        "connected":           True,
         "onboarding_complete": complete,
-        "stripe_account_id": wallet.stripe_account_id,
+        "stripe_account_id":   user.stripe_account_id,
     }
 
 
-# ─── Send a tip ───────────────────────────────────────────────────────────────
+# ── Send a tip ────────────────────────────────────────────────────────────────
 
-@router.post("/{post_id}")
+@router.post("/{post_id}", response_model=TipResponse)
 def send_tip(
     post_id: str,
     body: TipRequest,
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    validate_tip_amount(body.amount_cents)
+    tipper = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not tipper:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    user = get_user(payload["sub"], db)
+    existing = tip_service.check_idempotency(body.idempotency_key, db)
+    if existing:
+        return TipResponse(
+            tip_id           = str(existing.id),
+            status           = existing.status,
+            chosen_cents     = existing.chosen_amount_cents,
+            charged_cents    = existing.gross_amount_cents,
+            stripe_fee_cents = existing.stripe_fee_cents,
+            message          = "This tip was already submitted.",
+        )
 
-    post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if str(post.author_id) == str(user.id):
-        raise HTTPException(status_code=400, detail="Cannot tip your own post")
-
-    fees          = compute_gross(body.amount_cents)
-    charge_amount = fees["gross_cents"]
-    creator_net   = fees["creator_net_cents"]
+    post   = db.query(Post).filter(Post.id == post_id).first()
+    author = db.query(User).filter(User.id == post.author_id).first() if post else None
 
     try:
-        intent = stripe.PaymentIntent.create(
-            amount=charge_amount,
-            currency="usd",
-            payment_method=body.payment_method_id,
-            confirm=True,
-            automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
-            metadata={
-                "post_id":       post_id,
-                "from_user_id":  str(user.id),
-                "to_user_id":    str(post.author_id),
-                "chosen_cents":  str(body.amount_cents),
-                "creator_net":   str(creator_net),
+        tip_service.validate_tip(post, tipper, body.amount_cents)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not author or not author.stripe_account_id or not author.stripe_onboarding_complete:
+        raise HTTPException(status_code=402, detail="This creator hasn't set up payouts yet")
+
+    fees = fee_service.compute_fees(body.amount_cents, tip_service.get_creator_fee_pct(author))
+
+    try:
+        intent = tip_service.create_payment_intent(
+            fees              = fees,
+            payment_method_id = body.payment_method_id,
+            creator_stripe_id = author.stripe_account_id,
+            idempotency_key   = body.idempotency_key,
+            metadata          = {
+                "post_id":      post_id,
+                "from_user_id": str(tipper.id),
+                "to_user_id":   str(author.id),
+                "chosen_cents": str(body.amount_cents),
             },
         )
     except stripe.error.CardError as e:
         raise HTTPException(status_code=402, detail=str(e.user_message))
     except stripe.error.StripeError:
+        logger.exception("Stripe error creating tip")
         raise HTTPException(status_code=500, detail="Payment failed. Try again.")
 
-    if intent.status != "succeeded":
-        raise HTTPException(status_code=402, detail="Payment not completed")
-
-    tip = Tip(
-        from_user_id=user.id,
-        to_user_id=post.author_id,
-        post_id=post.id,
-        amount=charge_amount,
-        currency="usd",
-        status="completed",
-        stripe_payment_intent_id=intent.id,
+    tip = tip_service.create_tip_record(
+        db                = db,
+        fees              = fees,
+        tipper_id         = tipper.id,
+        author_id         = author.id,
+        post_id           = post.id,
+        payment_intent_id = intent.id,
+        idempotency_key   = body.idempotency_key,
     )
-    db.add(tip)
-
-    author_wallet = get_or_create_wallet(post.author_id, db)
-    author_wallet.balance      += creator_net
-    author_wallet.total_earned += creator_net
-
-    post.total_tips = (post.total_tips or 0) + charge_amount
-
     db.commit()
-    db.refresh(tip)
 
-    return {
-        "tip_id":             str(tip.id),
-        "chosen_cents":       body.amount_cents,
-        "charged_cents":      charge_amount,
-        "stripe_fee_cents":   fees["stripe_fee_cents"],
-        "platform_fee_cents": fees["platform_fee_cents"],
-        "creator_net_cents":  creator_net,
-        "status":             "success",
-    }
-
-
-# ─── Wallet ───────────────────────────────────────────────────────────────────
-
-@router.get("/wallet")
-def get_wallet(
-    payload: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    user = get_user(payload["sub"], db)
-    wallet = get_or_create_wallet(user.id, db)
-
-    pending_rows = (
-        db.query(WithdrawalRequest)
-        .filter(
-            WithdrawalRequest.user_id == str(user.id),
-            WithdrawalRequest.status == "pending",
-        )
-        .with_entities(WithdrawalRequest.amount)
-        .all()
+    return TipResponse(
+        tip_id           = str(tip.id),
+        status           = "processing",
+        chosen_cents     = fees.chosen_cents,
+        charged_cents    = fees.gross_cents,
+        stripe_fee_cents = fees.stripe_fee_cents,
     )
-    pending_total = sum(r.amount for r in pending_rows)
+    
 
-    return {
-        "balance_cents":            wallet.balance,
-        "available_cents":          wallet.balance - pending_total,
-        "pending_withdrawal_cents": pending_total,
-        "total_earned_cents":       wallet.total_earned,
-        "total_withdrawn_cents":    wallet.total_withdrawn,
-        "stripe_connected":         bool(wallet.stripe_account_id),
-        "onboarding_complete":      wallet.stripe_onboarding_complete == "true",
-    }
 
+
+# ── Tip history ───────────────────────────────────────────────────────────────
 
 @router.get("/history/received")
 def tip_history_received(
@@ -275,7 +249,10 @@ def tip_history_received(
     skip: int = 0,
     limit: int = 20,
 ):
-    user = get_user(payload["sub"], db)
+    user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
     tips = (
         db.query(Tip)
         .filter(Tip.to_user_id == user.id)
@@ -286,13 +263,13 @@ def tip_history_received(
     )
     return [
         {
-            "tip_id":            str(t.id),
-            "post_id":           str(t.post_id),
-            "from_user_id":      str(t.from_user_id),
-            "gross_cents":       t.amount,
-            "creator_net_cents": compute_gross(t.amount)["creator_net_cents"],
-            "status":            t.status,
-            "created_at":        t.created_at,
+            "tip_id":        str(t.id),
+            "post_id":       str(t.post_id),
+            "from_user_id":  str(t.from_user_id),
+            "gross_cents":   t.gross_amount_cents,
+            "creator_cents": t.creator_amount_cents,
+            "status":        t.status,
+            "created_at":    t.created_at,
         }
         for t in tips
     ]
@@ -305,7 +282,10 @@ def tip_history_sent(
     skip: int = 0,
     limit: int = 20,
 ):
-    user = get_user(payload["sub"], db)
+    user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
     tips = (
         db.query(Tip)
         .filter(Tip.from_user_id == user.id)
@@ -319,107 +299,9 @@ def tip_history_sent(
             "tip_id":      str(t.id),
             "post_id":     str(t.post_id),
             "to_user_id":  str(t.to_user_id),
-            "gross_cents": t.amount,
+            "gross_cents": t.gross_amount_cents,
             "status":      t.status,
             "created_at":  t.created_at,
         }
         for t in tips
-    ]
-
-
-# ─── Withdrawal requests ──────────────────────────────────────────────────────
-
-@router.post("/withdraw/request")
-def request_withdrawal(
-    body: WithdrawRequest,
-    payload: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    if body.amount_cents < 2500:
-        raise HTTPException(status_code=400, detail="Minimum withdrawal is $25.00")
-
-    user = get_user(payload["sub"], db)
-    wallet = get_or_create_wallet(user.id, db)
-
-    if wallet.stripe_onboarding_complete != "true":
-        raise HTTPException(
-            status_code=400,
-            detail="Complete Stripe onboarding before withdrawing",
-        )
-
-    if wallet.balance < 2500:
-        raise HTTPException(
-            status_code=400,
-            detail="Balance must be at least $25.00 to withdraw",
-        )
-
-    if body.amount_cents > wallet.balance:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    # Paryllel takes 20% at withdrawal
-    PLATFORM_CUT = 0.20
-    payout_amount = int(body.amount_cents * (1 - PLATFORM_CUT))
-
-    # Fire Stripe transfer immediately
-    try:
-        transfer = stripe.Transfer.create(
-            amount=payout_amount,
-            currency="usd",
-            destination=wallet.stripe_account_id,
-            metadata={
-                "paryllel_user_id":   str(user.id),
-                "requested_cents":    str(body.amount_cents),
-                "platform_fee_cents": str(body.amount_cents - payout_amount),
-            },
-        )
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Transfer failed: {str(e)}")
-
-    # Deduct from wallet and record
-    wallet.balance         -= body.amount_cents
-    wallet.total_withdrawn += payout_amount
-
-    req = WithdrawalRequest(
-        user_id=str(user.id),
-        amount=body.amount_cents,
-        status="paid",
-        stripe_transfer_id=transfer.id,
-    )
-    db.add(req)
-    db.commit()
-    db.refresh(req)
-
-    return {
-        "withdrawal_id":      req.id,
-        "requested_cents":    body.amount_cents,
-        "payout_cents":       payout_amount,
-        "platform_fee_cents": body.amount_cents - payout_amount,
-        "stripe_transfer_id": transfer.id,
-        "status":             "paid",
-        "created_at":         req.created_at,
-    }
-
-
-@router.get("/withdraw/history")
-def withdrawal_history(
-    payload: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    user = get_user(payload["sub"], db)
-    reqs = (
-        db.query(WithdrawalRequest)
-        .filter(WithdrawalRequest.user_id == str(user.id))
-        .order_by(desc(WithdrawalRequest.created_at))
-        .all()
-    )
-    return [
-        {
-            "id":           r.id,
-            "amount_cents": r.amount,
-            "status":       r.status,
-            "created_at":   r.created_at,
-            "reviewed_at":  r.reviewed_at,
-            "admin_note":   r.admin_note,
-        }
-        for r in reqs
     ]

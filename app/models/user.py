@@ -15,7 +15,7 @@ class User(Base):
     display_name = Column(String, nullable=True)
     bio = Column(Text, nullable=True)
     avatar_url = Column(Text, nullable=True)
-    banner_url = Column(Text, nullable=True)  # ← add here
+    banner_url = Column(Text, nullable=True)
 
     reputation = Column(Integer, nullable=False, server_default=text("0"))
     total_earned = Column(Numeric(10, 2), nullable=False, server_default=text("0"))
@@ -25,3 +25,11 @@ class User(Base):
 
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=False), nullable=False, server_default=text("NOW()"))
+
+    stripe_customer_id         = Column(String,  nullable=True)
+    stripe_account_id          = Column(String,  nullable=True)
+    stripe_onboarding_complete = Column(Boolean, nullable=False, server_default=text("false"))
+    payout_frozen              = Column(Boolean, nullable=False, server_default=text("false"))
+    payout_frozen_reason       = Column(Text,    nullable=True)
+    platform_fee_pct           = Column(Integer, nullable=False, server_default=text("20"))
+    total_earned_cents         = Column(Integer, nullable=False, server_default=text("0"))

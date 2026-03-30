@@ -35,4 +35,3 @@ class Post(Base):
     media = relationship("Media", back_populates="post", cascade="all, delete-orphan")
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
     votes = relationship("Vote", back_populates="post", cascade="all, delete-orphan")
-    tips = relationship("Tip", back_populates="post", cascade="all, delete-orphan")
