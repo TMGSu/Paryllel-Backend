@@ -25,7 +25,8 @@ class Post(Base):
     is_pinned = Column(Boolean, nullable=False, server_default=text("false"))
     is_locked = Column(Boolean, nullable=False, server_default=text("false"))
     is_removed = Column(Boolean, nullable=False, server_default=text("false"))
-    is_nsfw = Column(Boolean, nullable=False, server_default=text("false"))
+    is_nsfw         = Column(Boolean, nullable=False, server_default=text("false"))
+    subscriber_only = Column(Boolean, nullable=False, server_default=text("false"))
 
     created_at = Column(DateTime, nullable=False, server_default=text("NOW()"))
     updated_at = Column(DateTime, nullable=False, server_default=text("NOW()"))

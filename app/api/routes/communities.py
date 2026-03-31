@@ -11,6 +11,10 @@ from app.models.community_member import CommunityMember
 from app.models.community_rule import CommunityRule
 from app.models.user import User
 from app.models.post import Post
+from app.models.community_subscription_plan import CommunitySubscriptionPlan
+from app.models.community_subscription import CommunitySubscription
+from app.services import subscription_service
+from app.schemas.subscriptions import SubscriptionSetupRequest, SubscriptionSetupResponse
 
 router = APIRouter(prefix="/communities", tags=["communities"])
 
@@ -48,6 +52,8 @@ def format_community(c: Community):
         "is_nsfw": c.is_nsfw,
         "is_private": c.is_private,
         "created_at": c.created_at.isoformat() if c.created_at else None,
+        "subscription_enabled": c.subscription_enabled,
+        "subscription_price_cents": c.subscription_price_cents,
     }
 
 
@@ -346,3 +352,181 @@ def leave_community(
     community.member_count = max(0, community.member_count - 1)
     db.commit()
     return {"message": "Left community"}
+
+
+# ── Subscriptions ──────────────────────────────────────────────────────────────
+
+def _require_mod_or_owner(community: Community, user: User, db: Session):
+    membership = db.query(CommunityMember).filter(
+        CommunityMember.user_id      == user.id,
+        CommunityMember.community_id == community.id,
+        CommunityMember.is_moderator == True,
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="Only moderators can do this")
+
+
+@router.post("/{name}/subscription/setup", response_model=SubscriptionSetupResponse)
+def setup_subscription(
+    name:    str,
+    body:    SubscriptionSetupRequest,
+    payload: dict = Depends(verify_token),
+    db:      Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    user      = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    # Must be owner (created_by), not just any mod
+    if str(community.created_by) != str(user.id):
+        raise HTTPException(status_code=403, detail="Only the community owner can manage subscriptions")
+
+    try:
+        plan = subscription_service.setup_subscription_plan(community, user, body.price_cents, db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    db.commit()
+    return SubscriptionSetupResponse(
+        plan_id         = str(plan.id),
+        price_cents     = plan.price_cents,
+        stripe_price_id = plan.stripe_price_id,
+        is_active       = plan.is_active,
+    )
+
+
+@router.post("/{name}/subscribe")
+def subscribe(
+    name:    str,
+    body:    dict,
+    payload: dict = Depends(verify_token),
+    db:      Session = Depends(get_db),
+):
+    import logging
+    logger = logging.getLogger(__name__)
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    subscriber = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not subscriber:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    if not community.subscription_enabled:
+        raise HTTPException(status_code=400, detail="This community does not have subscriptions enabled")
+
+    plan = db.query(CommunitySubscriptionPlan).filter(
+        CommunitySubscriptionPlan.community_id == community.id,
+        CommunitySubscriptionPlan.is_active    == True,
+    ).first()
+    if not plan:
+        raise HTTPException(status_code=400, detail="No active subscription plan found")
+
+    owner = db.query(User).filter(User.id == community.created_by).first()
+    if not owner:
+        raise HTTPException(status_code=400, detail="Community owner not found")
+
+    payment_method_id = body.get("payment_method_id")
+    if not payment_method_id:
+        raise HTTPException(status_code=422, detail="payment_method_id is required")
+
+    try:
+        sub = subscription_service.create_community_subscription(
+            community         = community,
+            plan              = plan,
+            subscriber        = subscriber,
+            owner             = owner,
+            payment_method_id = payment_method_id,
+            db                = db,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Stripe error during community subscribe")
+        raise HTTPException(status_code=500, detail="Payment failed. Please try again.")
+
+    db.commit()
+    return {
+        "subscription_id":    str(sub.id),
+        "status":             sub.status,
+        "current_period_end": sub.current_period_end.isoformat(),
+    }
+
+
+@router.delete("/{name}/subscribe")
+def cancel_subscription(
+    name:    str,
+    payload: dict = Depends(verify_token),
+    db:      Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    subscriber = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not subscriber:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    try:
+        sub = subscription_service.cancel_community_subscription(community, subscriber, db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    db.commit()
+    return {
+        "subscription_id":    str(sub.id),
+        "status":             sub.status,
+        "current_period_end": sub.current_period_end.isoformat(),
+        "message": f"Canceled. Access continues until {sub.current_period_end.strftime('%B %d, %Y')}.",
+    }
+
+
+@router.get("/{name}/subscription/status")
+def subscription_status(
+    name:    str,
+    payload: dict = Depends(verify_token),
+    db:      Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    sub = (
+        db.query(CommunitySubscription)
+        .filter(
+            CommunitySubscription.community_id       == community.id,
+            CommunitySubscription.subscriber_user_id == user.id,
+        )
+        .order_by(CommunitySubscription.created_at.desc())
+        .first()
+    )
+
+    is_sub = subscription_service.is_subscribed(community.id, user.id, db)
+
+    return {
+        "subscriptions_enabled":  community.subscription_enabled,
+        "price_cents":            community.subscription_price_cents,
+        "is_subscribed":          is_sub,
+        "status":                 sub.status if sub else None,
+        "current_period_end":     sub.current_period_end.isoformat() if sub else None,
+    }

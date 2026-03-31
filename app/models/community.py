@@ -19,7 +19,9 @@ class Community(Base):
 
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=text("NOW()"))
-    updated_at = Column(DateTime, nullable=False, server_default=text("NOW()"))
+    updated_at                 = Column(DateTime, nullable=False, server_default=text("NOW()"))
+    subscription_enabled       = Column(Boolean, nullable=False, server_default=text("false"))
+    subscription_price_cents   = Column(Integer, nullable=True)
 
     creator = relationship("User", foreign_keys=[created_by])
     posts = relationship("Post", back_populates="community")

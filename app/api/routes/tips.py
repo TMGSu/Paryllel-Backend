@@ -82,15 +82,14 @@ def create_tip_intent(
     fees = fee_service.compute_fees(body.amount_cents, tip_service.get_creator_fee_pct(author))
 
     intent = stripe.PaymentIntent.create(
-        amount                 = fees.gross_cents,
-        currency               = "usd",
-        application_fee_amount = fees.application_fee_cents,
-        transfer_data          = {"destination": author.stripe_account_id},
-        metadata               = {
-            "post_id":         post_id,
-            "from_user_id":    str(tipper.id),
-            "to_user_id":      str(author.id),
-            "chosen_cents":    str(body.amount_cents),
+        amount   = fees.gross_cents,
+        currency = "usd",
+        metadata = {
+            "post_id":           post_id,
+            "from_user_id":      str(tipper.id),
+            "to_user_id":        str(author.id),
+            "chosen_cents":      str(body.amount_cents),
+            "creator_stripe_id": author.stripe_account_id,
         },
     )
 

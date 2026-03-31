@@ -144,17 +144,40 @@ def request_payout(user: User, amount_cents: int, db: Session) -> Payout:
     db.add(debit)
     db.flush()
 
-    # ── Step 6: Fire Stripe payout ────────────────────────────────────────────
+    # ── Step 6: Find the oldest matured tip charge to use as source_transaction
+    # Using source_transaction ties the transfer to a real charge on your account,
+    # ensuring funds are actually available before Stripe moves them.
+    now = datetime.now(timezone.utc)
+    source_tip = (
+        db.query(Tip)
+        .filter(
+            Tip.to_user_id   == locked_user.id,
+            Tip.status       == "completed",
+            Tip.available_at <= now,
+            Tip.is_disputed  == False,
+            Tip.stripe_charge_id != None,
+        )
+        .order_by(Tip.available_at.asc())
+        .first()
+    )
+
+    # ── Step 7: Fire Stripe Transfer from platform → creator Express account ──
     try:
-        stripe_payout = stripe.Payout.create(
-            amount         = amount_cents,
-            currency       = "usd",
-            stripe_account = locked_user.stripe_account_id,
-            metadata       = {
+        transfer_kwargs = dict(
+            amount      = amount_cents,
+            currency    = "usd",
+            destination = locked_user.stripe_account_id,
+            metadata    = {
                 "paryllel_user_id": str(locked_user.id),
                 "payout_id":        str(payout.id),
             },
         )
+        # Attach source_transaction when available — cleaner accounting
+        if source_tip and source_tip.stripe_charge_id:
+            transfer_kwargs["source_transaction"] = source_tip.stripe_charge_id
+
+        stripe_transfer = stripe.Transfer.create(**transfer_kwargs)
+
     except stripe.error.StripeError as e:
         # Reverse the debit immediately — do not leave balance stuck
         db.add(BalanceEntry(
@@ -162,27 +185,27 @@ def request_payout(user: User, amount_cents: int, db: Session) -> Payout:
             amount_cents = amount_cents,   # positive = re-credit
             entry_type   = "payout_reversed",
             reference_id = payout.id,
-            note         = f"Stripe call failed: {str(e)}",
+            note         = f"Stripe transfer failed: {str(e)}",
         ))
         payout.status         = "failed"
         payout.failure_reason = str(e)
-        db.commit()  # commit reversal so balance is restored even if caller swallows error
+        db.commit()
 
-        logger.error("payout_stripe_call_failed", extra={
+        logger.error("payout_stripe_transfer_failed", extra={
             "user_id":      str(locked_user.id),
             "amount_cents": amount_cents,
             "error":        str(e),
         })
-        raise ValueError(f"Stripe payout failed: {str(e)}")
+        raise ValueError(f"Stripe transfer failed: {str(e)}")
 
-    # ── Step 7: Store Stripe payout ID and commit everything atomically ───────
-    payout.stripe_payout_id = stripe_payout.id
+    # ── Step 8: Store Transfer ID and commit everything atomically ────────────
+    payout.stripe_payout_id = stripe_transfer.id   # reusing field for transfer ID
     db.commit()
 
-    logger.info("payout_requested", extra={
-        "user_id":          str(locked_user.id),
-        "amount_cents":     amount_cents,
-        "stripe_payout_id": stripe_payout.id,
-        "payout_id":        str(payout.id),
+    logger.info("payout_transfer_created", extra={
+        "user_id":            str(locked_user.id),
+        "amount_cents":       amount_cents,
+        "stripe_transfer_id": stripe_transfer.id,
+        "payout_id":          str(payout.id),
     })
     return payout

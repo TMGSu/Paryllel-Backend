@@ -9,6 +9,6 @@ class Settings:
     STRIPE_PCT: float             = 0.029
     STRIPE_FIXED_CENTS: int       = 30
     PAYOUT_THRESHOLD_CENTS: int   = 2500   # $25
-    PAYOUT_HOLD_DAYS: int         = 7
+    PAYOUT_HOLD_DAYS: int         = 14
 
 settings = Settings()

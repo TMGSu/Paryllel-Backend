@@ -46,21 +46,15 @@ def create_payment_intent(
     metadata: dict,
 ) -> stripe.PaymentIntent:
     """
-    Creates and confirms a Stripe destination charge.
+    Separate charges and transfers pattern.
 
-    application_fee_amount = fees.application_fee_cents
-    ────────────────────────────────────────────────────
-    This is the KEY value that enforces the strict 80/20 split.
+    Full gross_cents lands in the platform Stripe account.
+    No transfer_data — funds are held here until the creator requests withdrawal.
+    At withdrawal time, payout_service fires stripe.Transfer.create() to move
+    creator_amount_cents to their Express account, minus the platform fee.
 
-    Stripe routes the gross charge as follows:
-      - Full gross_cents hits the creator's Express account
-      - Stripe pulls application_fee_cents back to the platform account
-      - Stripe deducts its processing fee from application_fee_cents
-      - Creator nets: gross - application_fee = creator_cents (exactly 80% of chosen)
-      - Platform nets: application_fee - stripe_fee = platform_target_cents (exactly 20% of chosen)
-
-    Using fees.application_fee_cents (not fees.platform_target_cents) is what makes
-    the split exact — it accounts for the stripe fee being absorbed by the platform.
+    creator_stripe_id is kept in metadata so the transfer destination is
+    recorded at charge time and available to the payout flow.
     """
     return stripe.PaymentIntent.create(
         amount                    = fees.gross_cents,
@@ -68,9 +62,10 @@ def create_payment_intent(
         payment_method            = payment_method_id,
         confirm                   = True,
         automatic_payment_methods = {"enabled": True, "allow_redirects": "never"},
-        application_fee_amount    = fees.application_fee_cents,
-        transfer_data             = {"destination": creator_stripe_id},
-        metadata                  = metadata,
+        metadata                  = {
+            **metadata,
+            "creator_stripe_id": creator_stripe_id,   # stored for transfer at payout time
+        },
         idempotency_key           = f"pi_{idempotency_key}",
     )
 

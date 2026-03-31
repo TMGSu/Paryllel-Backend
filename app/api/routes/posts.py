@@ -43,6 +43,7 @@ class CreatePost(BaseModel):
     post_type: str = "text"  # text | image | video | link | poll
     tag: Optional[str] = None
     is_nsfw: bool = False
+    subscriber_only: bool = False
     link_url: Optional[str] = None
     media_urls: Optional[List[str]] = []
     poll_options: Optional[List[str]] = []
@@ -64,6 +65,7 @@ def format_post(post: Post, current_user_id=None, db: Session = None):
         "comment_count": post.comment_count,
         "tip_count": post.tip_count,
         "total_tips": post.total_tips,
+        "subscriber_only": post.subscriber_only,
         "created_at": post.created_at.isoformat() if post.created_at else None,
         "updated_at": post.updated_at.isoformat() if post.updated_at else None,
         "author": {
@@ -102,24 +104,21 @@ def list_posts(
     sort: str = Query("hot"),
     limit: int = Query(20),
     offset: int = Query(0),
+    feed: str = Query("all"),  # "all" | "subscribers"
     db: Session = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
 ):
+    from app.services import subscription_service
+
     query = db.query(Post).filter(Post.is_removed == False)
 
+    comm = None
     if community:
         comm = db.query(Community).filter(Community.name == community).first()
         if comm:
             query = query.filter(Post.community_id == comm.id)
 
-    if sort == "new":
-        query = query.order_by(desc(Post.created_at))
-    elif sort == "top":
-        query = query.order_by(desc(Post.upvotes - Post.downvotes))
-    else:
-        query = query.order_by(desc(Post.upvotes - Post.downvotes), desc(Post.created_at))
-
-    posts = query.offset(offset).limit(limit).all()
+    
 
     # Try to get current user for vote state
     current_user = None
@@ -134,9 +133,33 @@ def list_posts(
         except Exception:
             pass
 
+    # Resolve subscription access for feed filtering
+    is_sub = False
+    if current_user and comm:
+        is_sub = subscription_service.is_subscribed(comm.id, current_user.id, db)
+
+    if comm and comm.subscription_enabled:
+        if feed == "subscribers":
+            query = query.filter(Post.subscriber_only == True)
+            # Non-subscribers see the list (locked in UI), subscribers see normally
+        else:
+            # "all" feed: non-subscribers never receive subscriber_only posts
+            if not is_sub:
+                query = query.filter(Post.subscriber_only == False)
+
+    if sort == "new":
+        query = query.order_by(desc(Post.created_at))
+    elif sort == "top":
+        query = query.order_by(desc(Post.upvotes - Post.downvotes))
+    else:
+        query = query.order_by(desc(Post.upvotes - Post.downvotes), desc(Post.created_at))
+
+    posts = query.offset(offset).limit(limit).all()
+
     return {
         "posts": [format_post(p, current_user_id=current_user.id if current_user else None, db=db) for p in posts],
-        "total": query.count()
+        "total": query.count(),
+        "is_subscribed": is_sub,
     }
 
 @router.post("/")
@@ -162,6 +185,18 @@ def create_post(
     if not body.title.strip():
         raise HTTPException(status_code=400, detail="Title is required")
 
+    # subscriber_only guard
+    if body.subscriber_only:
+        if not community.subscription_enabled:
+            raise HTTPException(status_code=400, detail="Enable subscriptions before marking posts as subscriber-only")
+        membership = db.query(__import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember).filter(
+            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.user_id      == user.id,
+            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.community_id == community.id,
+            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.is_moderator == True,
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Only mods/owners can create subscriber-only posts")
+
     post = Post(
         author_id=user.id,
         community_id=community.id,
@@ -169,6 +204,7 @@ def create_post(
         body=body.body,
         post_type=body.post_type,
         is_nsfw=body.is_nsfw,
+        subscriber_only=body.subscriber_only,
     )
     db.add(post)
     db.flush()
