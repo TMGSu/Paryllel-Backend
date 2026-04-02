@@ -1,13 +1,15 @@
 # app/services/webhook_service.py
 # ── NEW: all imports top-level (no inline imports inside handlers) ──────────
 import logging
-import json
+
 from datetime import datetime, timezone
 
 import stripe
 from fastapi import HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+import json
+
 
 from app.core.config import settings
 from app.models.balance_entry import BalanceEntry
@@ -66,10 +68,11 @@ async def receive_webhook(request: Request, db: Session) -> dict:
 
 # ── UPDATED: handle_event ───────────────────────────────────────────────────
 # Now accepts raw_body for audit storage and event.created for ordering.
-def handle_event(event: dict, raw_body: bytes, db: Session) -> None:
+def handle_event(event, raw_body: bytes, db: Session) -> None:
+    event = json.loads(str(event))
     event_id      = event["id"]
     event_type    = event["type"]
-    event_created = event.get("created")          # Unix timestamp from Stripe
+    event_created = event.get("created")
     livemode      = event.get("livemode", False)
     data          = event["data"]["object"]
 
@@ -78,34 +81,33 @@ def handle_event(event: dict, raw_body: bytes, db: Session) -> None:
     # event_id.  If two Lambda/Gunicorn workers receive the same event
     # simultaneously, one will block here until the other commits, then see
     # status="succeeded" and bail out cleanly.
-    existing = (
-        db.execute(
-            select(StripeEvent)
-            .where(StripeEvent.id == event_id)
-            .with_for_update()           # row-level lock — safe under Postgres
-        ).scalar_one_or_none()
-    )
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.exc import IntegrityError
 
-    if existing and existing.status == "succeeded":
-        logger.info("duplicate_event_skipped", extra={
-            "event_id": event_id, "event_type": event_type
-        })
+    # Insert-first idempotency — only the worker that wins the INSERT processes.
+    # If two workers race, one gets IntegrityError and exits cleanly.
+    try:
+        db.execute(
+            pg_insert(StripeEvent).values(
+                id          = event_id,
+                event_type  = event_type,
+                status      = "processing",
+                created_at  = datetime.fromtimestamp(event_created, tz=timezone.utc) if event_created else datetime.now(timezone.utc),
+                livemode    = livemode,
+                raw_payload = raw_body.decode("utf-8", errors="replace"),
+            ).on_conflict_do_nothing(index_elements=["id"])
+        )
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.info("duplicate_event_skipped", extra={"event_id": event_id})
         return
 
-    # ── AUDIT: store rich metadata on first sight ───────────────────────────
-    if not existing:
-        db.add(StripeEvent(
-            id           = event_id,
-            event_type   = event_type,
-            status       = "processing",
-            created_at   = datetime.fromtimestamp(event_created, tz=timezone.utc) if event_created else datetime.now(timezone.utc),
-            livemode     = livemode,
-            raw_payload  = raw_body.decode("utf-8", errors="replace"),  # store for debugging
-        ))
-        db.flush()
-    else:
-        existing.status = "processing"
-        db.flush()
+    # Check if another worker already succeeded (on_conflict_do_nothing path)
+    existing = db.query(StripeEvent).filter(StripeEvent.id == event_id).first()
+    if existing and existing.status == "succeeded":
+        logger.info("duplicate_event_skipped", extra={"event_id": event_id})
+        return
 
     # ── DISPATCHER: clean, extensible handler map ───────────────────────────
     _HANDLERS: dict[str, callable] = {
@@ -115,8 +117,7 @@ def handle_event(event: dict, raw_body: bytes, db: Session) -> None:
         "charge.dispute.created":           _on_dispute_created,
         "payout.paid":                      _on_payout_paid,
         "payout.failed":                    _on_payout_failed,
-        "transfer.paid":                    _on_transfer_paid,
-        "transfer.failed":                  _on_transfer_failed,
+        
         "account.updated":                  _on_account_updated,
         "customer.subscription.created":    subscription_service.on_subscription_created,   # NEW
         "customer.subscription.updated":    subscription_service.on_subscription_updated,
@@ -233,13 +234,13 @@ def _on_payment_failed(pi: dict, db: Session) -> None:
 # ── NEW: FINANCIAL CORRECTNESS — handle refunds ─────────────────────────────
 def _on_charge_refunded(charge: dict, db: Session) -> None:
     """
-    Fires when a charge is fully or partially refunded.
-
-    We reverse the creator's balance entry and update their earned total so
-    the ledger stays consistent.  A negative BalanceEntry is the audit trail.
+    Handles partial and full refunds correctly.
+    Reverses only the creator's proportional share, not the raw refund amount.
+    Tracks cumulative refunds to handle multiple partial refund events.
     """
-    charge_id    = charge.get("id")
-    amount_refunded = charge.get("amount_refunded", 0)
+    charge_id       = charge.get("id")
+    total_refunded  = charge.get("amount_refunded", 0)   # cumulative total from Stripe
+    gross_amount    = charge.get("amount", 0)
 
     if not charge_id:
         logger.warning("charge_refunded_missing_charge_id")
@@ -247,86 +248,75 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
 
     tip = db.query(Tip).filter(Tip.stripe_charge_id == charge_id).first()
     if not tip:
-        # May not have a tip (non-tip charges on the account) — not an error
         logger.info("charge_refunded_no_tip_found", extra={"charge_id": charge_id})
         return
 
-    # Idempotency: don't double-reverse if we already recorded this refund
-    already_reversed = (
-        db.query(BalanceEntry)
-        .filter(
-            BalanceEntry.reference_id == tip.id,
-            BalanceEntry.entry_type   == "tip_refunded",
-        )
-        .first()
-    )
-    if already_reversed:
-        logger.info("charge_refunded_already_recorded", extra={"charge_id": charge_id})
+    # How much we've already reversed for this tip
+    already_reversed = db.query(
+        func.sum(BalanceEntry.amount_cents)
+    ).filter(
+        BalanceEntry.reference_id == tip.id,
+        BalanceEntry.entry_type   == "tip_refunded",
+    ).scalar() or 0
+    already_reversed = abs(already_reversed)   # stored as negative
+
+    # Creator's proportional share of the refund
+    if gross_amount > 0:
+        creator_refund_total = int(total_refunded * tip.creator_amount_cents / gross_amount)
+    else:
+        creator_refund_total = 0
+
+    # Delta = new cumulative creator refund minus what we've already reversed
+    delta = creator_refund_total - already_reversed
+    if delta <= 0:
+        logger.info("charge_refunded_no_new_delta", extra={
+            "charge_id": charge_id, "delta": delta
+        })
         return
 
-    # Negative amount = debit from creator's balance
     db.add(BalanceEntry(
         user_id      = tip.to_user_id,
-        amount_cents = -amount_refunded,
+        amount_cents = -delta,
         entry_type   = "tip_refunded",
         reference_id = tip.id,
-        note         = f"Refund on charge {charge_id}",
+        note         = f"Refund delta on charge {charge_id} ({delta} cents)",
     ))
 
     author = db.query(User).filter(User.id == tip.to_user_id).first()
     if author:
-        author.total_earned_cents = max(
-            0, (author.total_earned_cents or 0) - amount_refunded
-        )
+        author.total_earned_cents = max(0, (author.total_earned_cents or 0) - delta)
 
-    tip.status = "refunded"
+    if total_refunded >= gross_amount:
+        tip.status = "refunded"
+
     db.flush()
-
     logger.info("charge_refunded_processed", extra={
         "charge_id":      charge_id,
         "tip_id":         str(tip.id),
-        "amount_refunded": amount_refunded,
+        "delta_cents":    delta,
+        "total_refunded": total_refunded,
     })
 
-def _on_dispute_created(charge: dict, db: Session) -> None:
+def _on_dispute_created(dispute: dict, db: Session) -> None:
     """
-    Stripe fires charge.dispute.created with the Charge object as `data.object`.
-
-    Field mapping (safe extraction):
-      charge["id"]               → the charge ID  (use to look up Tip.stripe_charge_id)
-      charge["payment_intent"]   → the PI ID      (may be None for older charges)
-      charge["dispute"]          → the dispute ID  (string on newer API, may be absent)
-
-    We look up the tip by charge_id (set in payment_succeeded via latest_charge).
-    Falling back to payment_intent lookup handles edge cases where stripe_charge_id
-    wasn't stored yet.
+    charge.dispute.created sends a Dispute object, NOT a Charge.
+    Extract charge_id from dispute.charge, then look up the tip.
     """
-    charge_id      = charge.get("id")
-    payment_intent = charge.get("payment_intent")
-    dispute_id     = charge.get("dispute")
-    amount_cents   = charge.get("amount", 0)
+    dispute_id     = dispute.get("id")
+    charge_id      = dispute.get("charge")
+    amount_cents   = dispute.get("amount", 0)
+    reason         = dispute.get("reason", "unknown")
 
-    if not charge_id:
-        logger.warning("dispute_created_missing_charge_id", extra={"raw_keys": list(charge.keys())})
+    if not dispute_id or not charge_id:
+        logger.warning("dispute_created_missing_fields", extra={
+            "dispute_id": dispute_id, "charge_id": charge_id
+        })
         return
 
-    # Primary lookup by charge ID
     tip = db.query(Tip).filter(Tip.stripe_charge_id == charge_id).first()
-
-    # Fallback — if stripe_charge_id not yet set, try payment_intent ID
-    if not tip and payment_intent:
-        tip = db.query(Tip).filter(Tip.stripe_payment_intent_id == payment_intent).first()
-        if tip:
-            logger.info("dispute_tip_found_via_pi_fallback", extra={
-                "charge_id":      charge_id,
-                "payment_intent": payment_intent,
-                "tip_id":         str(tip.id),
-            })
-
     if not tip:
         logger.warning("dispute_created_no_tip_found", extra={
-            "charge_id":      charge_id,
-            "payment_intent": payment_intent,
+            "dispute_id": dispute_id, "charge_id": charge_id
         })
 
     tip_id  = tip.id         if tip else None
@@ -341,32 +331,23 @@ def _on_dispute_created(charge: dict, db: Session) -> None:
         creator = db.query(User).filter(User.id == user_id).first()
         if creator:
             creator.payout_frozen        = True
-            creator.payout_frozen_reason = f"Dispute on charge {charge_id}"
-        else:
-            logger.warning("dispute_creator_not_found", extra={
-                "user_id":   str(user_id),
-                "charge_id": charge_id,
-            })
-
-    # Use dispute_id if present, fall back to charge_id to avoid null PK
-    stripe_dispute_id = dispute_id or charge_id
+            creator.payout_frozen_reason = f"Dispute {dispute_id} on charge {charge_id}"
 
     db.add(Dispute(
         tip_id            = tip_id,
         user_id           = user_id,
-        stripe_dispute_id = stripe_dispute_id,
+        stripe_dispute_id = dispute_id,
         amount_cents      = amount_cents,
     ))
     db.flush()
 
     logger.warning("dispute_created", extra={
-        "charge_id":        charge_id,
-        "payment_intent":   payment_intent,
-        "dispute_id":       dispute_id,
-        "tip_id":           str(tip_id) if tip_id else None,
-        "user_id":          str(user_id) if user_id else None,
-        "amount_cents":     amount_cents,
-        "payout_frozen":    user_id is not None,
+        "dispute_id":    dispute_id,
+        "charge_id":     charge_id,
+        "reason":        reason,
+        "tip_id":        str(tip_id) if tip_id else None,
+        "user_id":       str(user_id) if user_id else None,
+        "amount_cents":  amount_cents,
     })
 
 
@@ -420,40 +401,7 @@ def _on_payout_failed(payout_data: dict, db: Session) -> None:
     })
 
 
-def _on_transfer_paid(transfer: dict, db: Session) -> None:
-    """transfer.paid — funds successfully moved to creator's Express account."""
-    transfer_id = transfer.get("id")
-    if not transfer_id:
-        return
 
-    payout = db.query(Payout).filter(Payout.stripe_payout_id == transfer_id).first()
-    if payout:
-        payout.status  = "paid"
-        payout.paid_at = datetime.now(timezone.utc)
-        db.flush()
-    logger.info("transfer_paid", extra={"stripe_transfer_id": transfer_id})
-
-
-def _on_transfer_failed(transfer: dict, db: Session) -> None:
-    """transfer.failed — reverse the ledger debit."""
-    transfer_id     = transfer.get("id")
-    failure_message = transfer.get("failure_message") or "Transfer failed"
-    if not transfer_id:
-        return
-
-    payout = db.query(Payout).filter(Payout.stripe_payout_id == transfer_id).first()
-    if payout:
-        payout.status         = "failed"
-        payout.failure_reason = failure_message
-        db.add(BalanceEntry(
-            user_id      = payout.user_id,
-            amount_cents = payout.amount_cents,
-            entry_type   = "payout_reversed",
-            reference_id = payout.id,
-            note         = f"Transfer failed: {failure_message}",
-        ))
-        db.flush()
-    logger.error("transfer_failed", extra={"stripe_transfer_id": transfer_id})
 
 
 def _on_account_updated(account: dict, db: Session) -> None:

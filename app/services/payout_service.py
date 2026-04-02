@@ -107,8 +107,12 @@ def request_payout(user: User, amount_cents: int, db: Session) -> Payout:
     if not locked_user.stripe_onboarding_complete or not locked_user.stripe_account_id:
         raise ValueError("Stripe account not connected")
 
+    if not isinstance(amount_cents, int) or amount_cents <= 0:
+        raise ValueError("Invalid withdrawal amount")
+    if amount_cents > 10_000_000:  # $100,000 hard cap
+        raise ValueError("Withdrawal amount exceeds maximum allowed")
     if amount_cents < settings.PAYOUT_THRESHOLD_CENTS:
-        raise ValueError(f"Minimum payout is ${settings.PAYOUT_THRESHOLD_CENTS // 100}.00")
+        raise ValueError(f"Minimum withdrawal is ${settings.PAYOUT_THRESHOLD_CENTS // 100}.00")
 
     # ── Step 3: Recompute balance AFTER acquiring lock ────────────────────────
     # Any concurrent request that committed a debit before us will now be
@@ -144,26 +148,11 @@ def request_payout(user: User, amount_cents: int, db: Session) -> Payout:
     db.add(debit)
     db.flush()
 
-    # ── Step 6: Find the oldest matured tip charge to use as source_transaction
-    # Using source_transaction ties the transfer to a real charge on your account,
-    # ensuring funds are actually available before Stripe moves them.
-    now = datetime.now(timezone.utc)
-    source_tip = (
-        db.query(Tip)
-        .filter(
-            Tip.to_user_id   == locked_user.id,
-            Tip.status       == "completed",
-            Tip.available_at <= now,
-            Tip.is_disputed  == False,
-            Tip.stripe_charge_id != None,
-        )
-        .order_by(Tip.available_at.asc())
-        .first()
-    )
-
-    # ── Step 7: Fire Stripe Transfer from platform → creator Express account ──
+    # ── Step 6: Fire Stripe Transfer from platform → creator Express account ──
+    # No source_transaction — withdrawal may span multiple tips so a single
+    # charge cannot represent the full amount. Platform balance is the source.
     try:
-        transfer_kwargs = dict(
+        stripe_transfer = stripe.Transfer.create(
             amount      = amount_cents,
             currency    = "usd",
             destination = locked_user.stripe_account_id,
@@ -172,40 +161,44 @@ def request_payout(user: User, amount_cents: int, db: Session) -> Payout:
                 "payout_id":        str(payout.id),
             },
         )
-        # Attach source_transaction when available — cleaner accounting
-        if source_tip and source_tip.stripe_charge_id:
-            transfer_kwargs["source_transaction"] = source_tip.stripe_charge_id
-
-        stripe_transfer = stripe.Transfer.create(**transfer_kwargs)
 
     except stripe.error.StripeError as e:
-        # Reverse the debit immediately — do not leave balance stuck
-        db.add(BalanceEntry(
-            user_id      = locked_user.id,
-            amount_cents = amount_cents,   # positive = re-credit
-            entry_type   = "payout_reversed",
-            reference_id = payout.id,
-            note         = f"Stripe transfer failed: {str(e)}",
-        ))
+        # Guard against double-reversal if this block runs more than once
+        already_reversed = db.query(BalanceEntry).filter(
+            BalanceEntry.reference_id == payout.id,
+            BalanceEntry.entry_type   == "payout_reversed",
+        ).first()
+        if not already_reversed:
+            db.add(BalanceEntry(
+                user_id      = locked_user.id,
+                amount_cents = amount_cents,
+                entry_type   = "payout_reversed",
+                reference_id = payout.id,
+                note         = f"Transfer failed: {type(e).__name__}",
+            ))
         payout.status         = "failed"
-        payout.failure_reason = str(e)
+        payout.failure_reason = type(e).__name__   # normalized, not raw str(e)
         db.commit()
 
         logger.error("payout_stripe_transfer_failed", extra={
             "user_id":      str(locked_user.id),
+            "payout_id":    str(payout.id),
             "amount_cents": amount_cents,
             "error":        str(e),
         })
-        raise ValueError(f"Stripe transfer failed: {str(e)}")
+        raise ValueError(f"Transfer failed — please try again or contact support.")
 
     # ── Step 8: Store Transfer ID and commit everything atomically ────────────
-    payout.stripe_payout_id = stripe_transfer.id   # reusing field for transfer ID
+    # stripe_payout_id stores the Stripe Transfer ID here (separate charges model)
+    payout.stripe_payout_id = stripe_transfer.id
+    payout.status           = "processing"
     db.commit()
 
-    logger.info("payout_transfer_created", extra={
+    logger.info("withdrawal_transfer_created", extra={
         "user_id":            str(locked_user.id),
+        "payout_id":          str(payout.id),
         "amount_cents":       amount_cents,
         "stripe_transfer_id": stripe_transfer.id,
-        "payout_id":          str(payout.id),
+        "destination":        locked_user.stripe_account_id,
     })
     return payout

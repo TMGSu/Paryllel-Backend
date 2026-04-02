@@ -4,7 +4,7 @@ All business logic for community subscriptions.
 Stripe Connect destination charges — same pattern as tip_service.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 import stripe
 
@@ -48,6 +48,11 @@ def _active_subscription(community_id, subscriber_user_id, db: Session) -> Commu
     status=active OR (status=canceled but current_period_end is in the future).
     """
     now = datetime.now(timezone.utc)
+    # Access policy:
+    # - active: full access
+    # - past_due: grace period access (payment failed but retrying — intentional product choice)
+    # - cancel_at_period_end=True but still active: access until period ends
+    # - canceled: access only if current_period_end is in the future (already paid period)
     return (
         db.query(CommunitySubscription)
         .filter(
@@ -109,6 +114,8 @@ def setup_subscription_plan(
 
     if price_cents < 100:
         raise ValueError("Minimum subscription price is $1.00.")
+    if price_cents > 100_000:
+        raise ValueError("Maximum subscription price is $1,000.00.")
 
     # Deactivate any existing plan
     existing_plan = (
@@ -119,26 +126,17 @@ def setup_subscription_plan(
         )
         .first()
     )
-    if existing_plan:
-        # Archive the old Stripe price (can't delete, only deactivate)
-        try:
-            stripe.Price.modify(existing_plan.stripe_price_id, active=False)
-        except stripe.error.StripeError:
-            logger.warning("Could not deactivate old Stripe price", extra={"price_id": existing_plan.stripe_price_id})
-        existing_plan.is_active = False
-        db.flush()
-
-    # Create (or reuse) Stripe Product
-    if existing_plan and existing_plan.stripe_product_id:
-        product_id = existing_plan.stripe_product_id
-    else:
+    # Reuse existing product ID or create a new one
+    product_id = existing_plan.stripe_product_id if existing_plan else None
+    if not product_id:
         product = stripe.Product.create(
             name     = f"{community.display_name or community.name} — Monthly Subscription",
             metadata = {"community_id": str(community.id)},
         )
         product_id = product.id
 
-    # Always create a new Price when amount changes
+    # Create new Stripe Price FIRST — before retiring the old one.
+    # If this fails, old plan stays active and community is not left without a plan.
     price = stripe.Price.create(
         product        = product_id,
         unit_amount    = price_cents,
@@ -147,6 +145,7 @@ def setup_subscription_plan(
         metadata       = {"community_id": str(community.id)},
     )
 
+    # New plan created in DB — only NOW retire the old one
     plan = CommunitySubscriptionPlan(
         community_id      = community.id,
         price_cents       = price_cents,
@@ -156,6 +155,13 @@ def setup_subscription_plan(
         is_active         = True,
     )
     db.add(plan)
+
+    if existing_plan:
+        try:
+            stripe.Price.modify(existing_plan.stripe_price_id, active=False)
+        except stripe.error.StripeError:
+            logger.warning("Could not deactivate old Stripe price", extra={"price_id": existing_plan.stripe_price_id})
+        existing_plan.is_active = False
 
     community.subscription_enabled     = True
     community.subscription_price_cents = price_cents
@@ -220,8 +226,6 @@ def create_community_subscription(
         },
     )
 
-    # current_period_end may be absent if status=incomplete — fall back to 30 days
-    from datetime import timedelta
     raw_period_end = getattr(stripe_sub, "current_period_end", None)
     if raw_period_end:
         period_end = datetime.fromtimestamp(raw_period_end, tz=timezone.utc)
@@ -274,10 +278,14 @@ def cancel_community_subscription(
         cancel_at_period_end=True,
     )
 
-    sub.status = "canceled"
+    # Do NOT set status="canceled" — subscription is still active until period end.
+    # Stripe will fire customer.subscription.updated with cancel_at_period_end=true,
+    # then customer.subscription.deleted when it actually expires.
+    # Webhook truth drives the terminal state.
+    sub.cancel_at_period_end = True
     db.flush()
 
-    logger.info("community_subscription_canceled", extra={
+    logger.info("community_subscription_cancel_scheduled", extra={
         "community_id":  str(community.id),
         "subscriber_id": str(subscriber.id),
         "access_until":  sub.current_period_end.isoformat(),
@@ -356,7 +364,7 @@ def on_subscription_created(stripe_sub: dict, db: Session) -> None:
 
 
 def on_invoice_payment_succeeded(invoice: dict, db: Session) -> None:
-    """invoice.payment_succeeded — reactivate past_due subscriptions"""
+    """invoice.payment_succeeded — reactivate any non-active subscription and sync period end."""
     stripe_sub_id = invoice.get("subscription")
     if not stripe_sub_id:
         return
@@ -369,7 +377,18 @@ def on_invoice_payment_succeeded(invoice: dict, db: Session) -> None:
     if not record:
         return
 
-    if record.status == "past_due":
+    # Reactivate from any recoverable non-active state
+    if record.status in ("past_due", "incomplete"):
         record.status = "active"
-        db.flush()
-        logger.info("subscription_reactivated", extra={"stripe_sub_id": stripe_sub_id})
+
+    # Sync period end from invoice if available
+    period_end = invoice.get("period_end") or invoice.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
+    if period_end:
+        record.current_period_end = datetime.fromtimestamp(period_end, tz=timezone.utc)
+
+    record.cancel_at_period_end = False
+    db.flush()
+    logger.info("subscription_invoice_paid", extra={
+        "stripe_sub_id": stripe_sub_id,
+        "status":        record.status,
+    })

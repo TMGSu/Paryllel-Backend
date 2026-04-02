@@ -22,11 +22,17 @@ def get_creator_fee_pct(creator: User) -> int:
     return getattr(creator, "platform_fee_pct", None) or settings.DEFAULT_PLATFORM_FEE_PCT
 
 
-def validate_tip(post: Post | None, tipper: User, chosen_cents: int) -> None:
+def validate_tip(post: Post | None, tipper: User, chosen_cents: int, author: User | None = None) -> None:
     if not post:
         raise ValueError("Post not found")
+    if post.is_removed:
+        raise ValueError("This post has been removed")
+    if post.is_locked:
+        raise ValueError("This post is locked")
     if str(post.author_id) == str(tipper.id):
         raise ValueError("Cannot tip your own post")
+    if author and author.is_banned:
+        raise ValueError("This creator is not available")
     if chosen_cents < 300:
         raise ValueError("Minimum tip is $3.00")
     if chosen_cents > 100_000:
@@ -44,6 +50,8 @@ def create_payment_intent(
     creator_stripe_id: str,
     idempotency_key: str,
     metadata: dict,
+    tipper_id: str = "",
+    author_id: str = "",
 ) -> stripe.PaymentIntent:
     """
     Separate charges and transfers pattern.
@@ -56,7 +64,7 @@ def create_payment_intent(
     creator_stripe_id is kept in metadata so the transfer destination is
     recorded at charge time and available to the payout flow.
     """
-    return stripe.PaymentIntent.create(
+    intent = stripe.PaymentIntent.create(
         amount                    = fees.gross_cents,
         currency                  = "usd",
         payment_method            = payment_method_id,
@@ -64,10 +72,17 @@ def create_payment_intent(
         automatic_payment_methods = {"enabled": True, "allow_redirects": "never"},
         metadata                  = {
             **metadata,
-            "creator_stripe_id": creator_stripe_id,   # stored for transfer at payout time
+            "creator_stripe_id": creator_stripe_id,
         },
-        idempotency_key           = f"pi_{idempotency_key}",
+        idempotency_key           = f"pi_{tipper_id}_{idempotency_key}",
     )
+    logger.info("payment_intent_created", extra={
+        "pi_id":       intent.id,
+        "tipper_id":   tipper_id,
+        "author_id":   author_id,
+        "gross_cents": fees.gross_cents,
+    })
+    return intent
 
 
 def create_tip_record(
@@ -81,9 +96,13 @@ def create_tip_record(
 ) -> Tip:
     """
     Creates a Tip record with status='created'.
-    Webhook moves it to 'completed' — we never trust the PI response alone.
-    available_at is set PAYOUT_HOLD_DAYS out — funds are locked until matured.
+    IMPORTANT: Tip.idempotency_key has a UNIQUE constraint in the DB.
+    If a duplicate key is inserted, sqlalchemy raises IntegrityError —
+    caller must catch this and return the existing tip instead.
+    Webhook moves status to 'completed' — never trust the PI response alone.
+    available_at is set PAYOUT_HOLD_DAYS out — funds locked until matured.
     """
+    from sqlalchemy.exc import IntegrityError
     tip = Tip(
         from_user_id             = tipper_id,
         to_user_id               = author_id,
@@ -99,6 +118,14 @@ def create_tip_record(
         status                   = "created",
         available_at             = datetime.now(timezone.utc) + timedelta(days=settings.PAYOUT_HOLD_DAYS),
     )
-    db.add(tip)
-    db.flush()
+    try:
+        db.add(tip)
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        # Race condition — another request already inserted this idempotency key
+        existing = db.query(Tip).filter(Tip.idempotency_key == idempotency_key).first()
+        if existing:
+            return existing
+        raise  # should never happen — re-raise if we can't find the conflicting row
     return tip

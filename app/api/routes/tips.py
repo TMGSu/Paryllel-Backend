@@ -72,7 +72,7 @@ def create_tip_intent(
     author = db.query(User).filter(User.id == post.author_id).first() if post else None
 
     try:
-        tip_service.validate_tip(post, tipper, body.amount_cents)
+        tip_service.validate_tip(post, tipper, body.amount_cents, author)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -269,6 +269,7 @@ def tip_history_received(
             "creator_cents": t.creator_amount_cents,
             "status":        t.status,
             "created_at":    t.created_at,
+            "available_at":  t.available_at.isoformat() if t.available_at else None,
         }
         for t in tips
     ]

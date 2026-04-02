@@ -1,5 +1,5 @@
 # app/models/community_subscription.py
-from sqlalchemy import Column, String, DateTime, ForeignKey, text
+from sqlalchemy import Boolean, Column, String, DateTime, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -16,6 +16,7 @@ class CommunitySubscription(Base):
     # active | past_due | canceled | incomplete
     status                 = Column(String, nullable=False, server_default=text("'active'"))
     current_period_end     = Column(DateTime, nullable=False)
+    cancel_at_period_end   = Column(Boolean, nullable=False, server_default=text("false"))
     created_at             = Column(DateTime, nullable=False, server_default=text("NOW()"))
     updated_at             = Column(DateTime, nullable=False, server_default=text("NOW()"))
 

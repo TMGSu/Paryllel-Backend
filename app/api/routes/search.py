@@ -7,6 +7,13 @@ from app.core.deps import get_db
 from app.models.community import Community
 from app.models.post import Post
 from app.models.user import User
+from app.models.community_subscription import CommunitySubscription
+from app.core.auth import verify_token
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import Optional
+from datetime import datetime, timezone
+
+optional_security = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -115,10 +122,11 @@ def search_communities(
 def search_posts(
     q: str = Query(..., min_length=1),
     community: Optional[str] = Query(None),
-    sort: str = Query("relevance"),  # relevance | new | top
+    sort: str = Query("relevance"),
     limit: int = Query(20, le=50),
     offset: int = Query(0),
     db: Session = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
 ):
     """
     Search posts by title and body.
@@ -127,6 +135,19 @@ def search_posts(
     """
     term = q.strip().lower()
 
+    current_user = None
+    if credentials:
+        try:
+            from jwt import PyJWKClient
+            import jwt, os
+            jwk_client = PyJWKClient(f"https://{os.getenv('CLERK_FRONTEND_API')}/.well-known/jwks.json")
+            signing_key = jwk_client.get_signing_key_from_jwt(credentials.credentials)
+            payload = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"])
+            current_user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
     query = (
         db.query(Post)
         .filter(
@@ -134,6 +155,17 @@ def search_posts(
             or_(
                 func.lower(Post.title).contains(term),
                 func.lower(Post.body).contains(term),
+            ),
+            or_(
+                Post.subscriber_only == False,
+                Post.author_id == current_user.id if current_user else False,
+                Post.community_id.in_(
+                    db.query(CommunitySubscription.community_id).filter(
+                        CommunitySubscription.subscriber_user_id == current_user.id if current_user else None,
+                        CommunitySubscription.status == "active",
+                        CommunitySubscription.current_period_end > now,
+                    )
+                ) if current_user else False,
             )
         )
     )
@@ -239,11 +271,12 @@ def global_search(
         .all()
     )
 
-    # Posts — top 5
+    # Posts — top 5 (exclude subscriber-only)
     posts = (
         db.query(Post)
         .filter(
             Post.is_removed == False,
+            Post.subscriber_only == False,
             or_(
                 func.lower(Post.title).contains(term),
                 func.lower(Post.body).contains(term),

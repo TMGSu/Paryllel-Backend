@@ -12,6 +12,9 @@ from app.models.community import Community
 from app.models.user import User
 from app.models.vote import Vote
 from app.models.media import Media
+from app.models.community_member import CommunityMember
+from app.models.community_subscription import CommunitySubscription
+from datetime import datetime, timezone
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import re
@@ -95,6 +98,23 @@ def format_post(post: Post, current_user_id=None, db: Session = None):
     return result
 
 
+def check_post_visibility(post: Post, current_user: User | None, db: Session) -> bool:
+    """Returns True if the current user is allowed to see this post."""
+    if not post.subscriber_only:
+        return True
+    if current_user and str(post.author_id) == str(current_user.id):
+        return True
+    if current_user:
+        now = datetime.now(timezone.utc)
+        sub = db.query(CommunitySubscription).filter(
+            CommunitySubscription.community_id == post.community_id,
+            CommunitySubscription.subscriber_user_id == current_user.id,
+            CommunitySubscription.status == "active",
+            CommunitySubscription.current_period_end > now,
+        ).first()
+        return sub is not None
+    return False
+
 
 optional_security = HTTPBearer(auto_error=False)
 
@@ -141,11 +161,28 @@ def list_posts(
     if comm and comm.subscription_enabled:
         if feed == "subscribers":
             query = query.filter(Post.subscriber_only == True)
-            # Non-subscribers see the list (locked in UI), subscribers see normally
         else:
-            # "all" feed: non-subscribers never receive subscriber_only posts
             if not is_sub:
                 query = query.filter(Post.subscriber_only == False)
+    else:
+        # No specific community or subscription not enabled —
+        # still hide subscriber_only posts the user isn't subscribed to
+        if current_user:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            query = query.filter(
+                (Post.subscriber_only == False) |
+                (Post.author_id == current_user.id) |
+                Post.community_id.in_(
+                    db.query(CommunitySubscription.community_id).filter(
+                        CommunitySubscription.subscriber_user_id == current_user.id,
+                        CommunitySubscription.status == "active",
+                        CommunitySubscription.current_period_end > now,
+                    )
+                )
+            )
+        else:
+            query = query.filter(Post.subscriber_only == False)
 
     if sort == "new":
         query = query.order_by(desc(Post.created_at))
@@ -189,10 +226,10 @@ def create_post(
     if body.subscriber_only:
         if not community.subscription_enabled:
             raise HTTPException(status_code=400, detail="Enable subscriptions before marking posts as subscriber-only")
-        membership = db.query(__import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember).filter(
-            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.user_id      == user.id,
-            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.community_id == community.id,
-            __import__('app.models.community_member', fromlist=['CommunityMember']).CommunityMember.is_moderator == True,
+        membership = db.query(CommunityMember).filter(
+            CommunityMember.user_id == user.id,
+            CommunityMember.community_id == community.id,
+            CommunityMember.is_moderator == True,
         ).first()
         if not membership:
             raise HTTPException(status_code=403, detail="Only mods/owners can create subscriber-only posts")
@@ -234,19 +271,59 @@ def create_post(
     return {"message": "Post created", "post": format_post(post)}
 
 @router.get("/slug/{slug}")
-def get_post_by_slug(slug: str, db: Session = Depends(get_db)):
+def get_post_by_slug(
+    slug: str,
+    db: Session = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+):
     post = db.query(Post).filter(Post.slug == slug, Post.is_removed == False).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    return format_post(post)
+
+    current_user = None
+    if credentials:
+        try:
+            from jwt import PyJWKClient
+            import jwt, os
+            jwk_client = PyJWKClient(f"https://{os.getenv('CLERK_FRONTEND_API')}/.well-known/jwks.json")
+            signing_key = jwk_client.get_signing_key_from_jwt(credentials.credentials)
+            payload = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"])
+            current_user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+        except Exception:
+            pass
+
+    if not check_post_visibility(post, current_user, db):
+        raise HTTPException(status_code=403, detail="This post is for subscribers only")
+
+    return format_post(post, current_user_id=current_user.id if current_user else None, db=db)
 
 
 @router.get("/{post_id}")
-def get_post(post_id: str, db: Session = Depends(get_db)):
+def get_post(
+    post_id: str,
+    db: Session = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+):
     post = db.query(Post).filter(Post.id == post_id, Post.is_removed == False).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    return format_post(post)
+
+    current_user = None
+    if credentials:
+        try:
+            from jwt import PyJWKClient
+            import jwt, os
+            jwk_client = PyJWKClient(f"https://{os.getenv('CLERK_FRONTEND_API')}/.well-known/jwks.json")
+            signing_key = jwk_client.get_signing_key_from_jwt(credentials.credentials)
+            payload = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"])
+            current_user = db.query(User).filter(User.clerk_user_id == payload["sub"]).first()
+        except Exception:
+            pass
+
+    if not check_post_visibility(post, current_user, db):
+        raise HTTPException(status_code=403, detail="This post is for subscribers only")
+
+    return format_post(post, current_user_id=current_user.id if current_user else None, db=db)
 
 
 @router.delete("/{post_id}")

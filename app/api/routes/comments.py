@@ -1,67 +1,57 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from pydantic import BaseModel
 from typing import Optional
 
 from app.core.deps import get_db, get_db_with_clerk_id
 from app.core.auth import verify_token
-from app.models.community import Community
-from app.models.community_member import CommunityMember
+from app.models.comment import Comment
+from app.models.post import Post
 from app.models.user import User
+from app.models.vote import Vote
 
-router = APIRouter(prefix="/communities", tags=["communities"])
-
-
-class CreateCommunity(BaseModel):
-    name: str
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    category: Optional[str] = None
-    icon_url: Optional[str] = None
-    banner_url: Optional[str] = None
-    is_nsfw: bool = False
-    is_private: bool = False
+router = APIRouter(prefix="/comments", tags=["comments"])
 
 
-def format_community(c: Community):
+class CreateComment(BaseModel):
+    post_id: str
+    body: str
+    parent_id: Optional[str] = None
+
+
+def format_comment(c: Comment):
     return {
         "id": str(c.id),
-        "name": c.name,
-        "display_name": c.display_name,
-        "description": c.description,
-        "category": c.category if hasattr(c, "category") else None,
-        "icon_url": c.icon_url,
-        "banner_url": c.banner_url,
-        "member_count": c.member_count,
-        "is_nsfw": c.is_nsfw,
-        "is_private": c.is_private,
+        "post_id": str(c.post_id),
+        "parent_id": str(c.parent_id) if c.parent_id else None,
+        "body": c.body,
+        "upvotes": c.upvotes,
+        "downvotes": c.downvotes,
+        "is_removed": c.is_removed,
         "created_at": c.created_at.isoformat() if c.created_at else None,
+        "author": {
+            "username": c.author.username,
+            "display_name": c.author.display_name,
+            "avatar_url": c.author.avatar_url,
+            "reputation": c.author.reputation,
+        } if c.author else None,
     }
 
 
 @router.get("/")
-def list_communities(db: Session = Depends(get_db)):
-    communities = (
-        db.query(Community)
-        .filter(Community.is_private == False)
-        .order_by(Community.member_count.desc())
-        .limit(50)
-        .all()
-    )
-    return {"communities": [format_community(c) for c in communities]}
-
-
-@router.get("/{name}")
-def get_community(name: str, db: Session = Depends(get_db)):
-    c = db.query(Community).filter(Community.name == name).first()
-    if not c:
-        raise HTTPException(status_code=404, detail="Community not found")
-    return format_community(c)
+def list_comments(post_id: str, db: Session = Depends(get_db)):
+    comments = db.query(Comment).filter(
+        Comment.post_id == post_id,
+        Comment.is_removed == False,
+        Comment.parent_id == None
+    ).order_by(desc(Comment.upvotes)).all()
+    return {"comments": [format_comment(c) for c in comments]}
 
 
 @router.post("/")
-def create_community(
-    body: CreateCommunity,
+def create_comment(
+    body: CreateComment,
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
@@ -72,44 +62,36 @@ def create_community(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    existing = db.query(Community).filter(Community.name == body.name.lower()).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Community name already taken")
+    post = db.query(Post).filter(Post.id == body.post_id, Post.is_removed == False).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-    community = Community(
-        name=body.name.lower().strip(),
-        display_name=body.display_name,
-        description=body.description,
-        icon_url=body.icon_url,
-        banner_url=body.banner_url,
-        is_nsfw=body.is_nsfw,
-        is_private=body.is_private,
-        created_by=user.id,
-        member_count=1,
+    if post.is_locked:
+        raise HTTPException(status_code=400, detail="Post is locked")
+
+    if not body.body.strip():
+        raise HTTPException(status_code=400, detail="Comment body is required")
+
+    comment = Comment(
+        post_id=body.post_id,
+        author_id=user.id,
+        body=body.body.strip(),
+        parent_id=body.parent_id,
     )
+    db.add(comment)
+    post.comment_count += 1
 
-    # Set category if the model column exists
-    if hasattr(community, "category"):
-        community.category = body.category
-
-    db.add(community)
-    db.flush()
-
-    membership = CommunityMember(
-        user_id=user.id,
-        community_id=community.id,
-        is_moderator=True,
-    )
-    db.add(membership)
+    # Bump reputation
+    user.reputation += 2
     db.commit()
-    db.refresh(community)
+    db.refresh(comment)
 
-    return {"message": "Community created", "community": format_community(community)}
+    return {"message": "Comment created", "comment": format_comment(comment)}
 
 
-@router.post("/{name}/join")
-def join_community(
-    name: str,
+@router.delete("/{comment_id}")
+def delete_comment(
+    comment_id: str,
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
@@ -117,52 +99,64 @@ def join_community(
     get_db_with_clerk_id(clerk_user_id, db)
 
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    community = db.query(Community).filter(Community.name == name).first()
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
 
-    if not community:
-        raise HTTPException(status_code=404, detail="Community not found")
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if str(comment.author_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not your comment")
 
-    existing = db.query(CommunityMember).filter(
-        CommunityMember.user_id == user.id,
-        CommunityMember.community_id == community.id,
-    ).first()
-
-    if existing:
-        raise HTTPException(status_code=400, detail="Already a member")
-
-    membership = CommunityMember(user_id=user.id, community_id=community.id)
-    db.add(membership)
-    community.member_count += 1
+    comment.is_removed = True
     db.commit()
 
-    return {"message": "Joined community"}
+    return {"message": "Comment deleted"}
 
 
-@router.delete("/{name}/leave")
-def leave_community(
-    name: str,
+@router.post("/{comment_id}/vote")
+def vote_comment(
+    comment_id: str,
+    value: int,
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
+    if value not in (1, -1):
+        raise HTTPException(status_code=400, detail="Vote value must be 1 or -1")
+
     clerk_user_id = payload["sub"]
     get_db_with_clerk_id(clerk_user_id, db)
 
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    community = db.query(Community).filter(Community.name == name).first()
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
 
-    if not community:
-        raise HTTPException(status_code=404, detail="Community not found")
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
 
-    membership = db.query(CommunityMember).filter(
-        CommunityMember.user_id == user.id,
-        CommunityMember.community_id == community.id,
-    ).first()
+    existing = db.query(Vote).filter(Vote.user_id == user.id, Vote.comment_id == comment.id).first()
 
-    if not membership:
-        raise HTTPException(status_code=400, detail="Not a member")
+    if existing:
+        if existing.value == value:
+            if value == 1:
+                comment.upvotes = max(0, comment.upvotes - 1)
+            else:
+                comment.downvotes = max(0, comment.downvotes - 1)
+            db.delete(existing)
+            db.commit()
+            return {"message": "Vote removed"}
+        else:
+            if value == 1:
+                comment.upvotes += 1
+                comment.downvotes = max(0, comment.downvotes - 1)
+            else:
+                comment.downvotes += 1
+                comment.upvotes = max(0, comment.upvotes - 1)
+            existing.value = value
+    else:
+        vote = Vote(user_id=user.id, comment_id=comment.id, value=value)
+        db.add(vote)
+        if value == 1:
+            comment.upvotes += 1
+        else:
+            comment.downvotes += 1
 
-    db.delete(membership)
-    community.member_count = max(0, community.member_count - 1)
     db.commit()
-
-    return {"message": "Left community"}
+    return {"message": "Vote recorded"}
