@@ -5,6 +5,8 @@ from typing import Optional
 
 from app.core.deps import get_db, get_db_with_clerk_id
 from app.core.auth import verify_token
+from app.models.community import Community
+from app.models.community_member import CommunityMember
 from app.models.user import User
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -333,3 +335,93 @@ def get_my_communities(
         }
         for r in rows
     ]
+    
+@router.get("/me/subscriptions")
+def get_my_subscriptions(
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    from app.models.community_subscription import CommunitySubscription
+    from app.models.community import Community
+    from datetime import datetime, timezone
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    now = datetime.now(timezone.utc)
+    rows = (
+        db.query(CommunitySubscription, Community)
+        .join(Community, CommunitySubscription.community_id == Community.id)
+        .filter(
+            CommunitySubscription.subscriber_user_id == user.id,
+            CommunitySubscription.status.in_(["active", "past_due"]),
+        )
+        .order_by(CommunitySubscription.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": str(r.CommunitySubscription.id),
+            "community_name": r.Community.name,
+            "community_display_name": r.Community.display_name,
+            "community_icon_url": r.Community.icon_url,
+            "status": r.CommunitySubscription.status,
+            "price_cents": r.Community.subscription_price_cents,
+            "current_period_end": r.CommunitySubscription.current_period_end.isoformat() if r.CommunitySubscription.current_period_end else None,
+            "cancel_at_period_end": r.CommunitySubscription.cancel_at_period_end,
+        }
+        for r in rows
+    ]
+
+@router.patch("/me/settings")
+def update_user_settings(
+    body: dict,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if "show_nsfw" in body:
+        user.show_nsfw = bool(body["show_nsfw"])
+    db.commit()
+    return {"message": "Settings updated", "show_nsfw": user.show_nsfw}
+
+@router.get("/me/communities")
+def get_my_communities(
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    rows = (
+        db.query(CommunityMember, Community)
+        .join(Community, Community.id == CommunityMember.community_id)
+        .filter(CommunityMember.user_id == user.id)
+        .order_by(CommunityMember.joined_at.desc())
+        .all()
+    )
+
+    return {
+        "communities": [
+            {
+                "name": c.name,
+                "display_name": c.display_name,
+                "icon_url": c.icon_url,
+                "member_count": c.member_count,
+                "is_moderator": cm.is_moderator,
+            }
+            for cm, c in rows
+        ]
+    }

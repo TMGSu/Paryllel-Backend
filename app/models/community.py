@@ -16,6 +16,7 @@ class Community(Base):
     member_count = Column(Integer, nullable=False, server_default=text("0"))
     is_nsfw = Column(Boolean, nullable=False, server_default=text("false"))
     is_private = Column(Boolean, nullable=False, server_default=text("false"))
+    category = Column(String, nullable=True)
 
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=text("NOW()"))

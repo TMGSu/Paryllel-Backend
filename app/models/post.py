@@ -2,6 +2,7 @@ from sqlalchemy import Column, String, Text, Integer, Boolean, DateTime, Foreign
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
+from app.models.community_tag import CommunityTag
 
 
 class Post(Base):
@@ -12,6 +13,8 @@ class Post(Base):
     community_id = Column(UUID(as_uuid=True), ForeignKey("communities.id", ondelete="CASCADE"), nullable=False)
 
     title = Column(String, nullable=False)
+    tag_id = Column(UUID(as_uuid=True), ForeignKey("community_tags.id", ondelete="SET NULL"), nullable=True)
+    tag = relationship(CommunityTag, foreign_keys=[tag_id])
     slug = Column(String, unique=True, nullable=True, index=True)
     body = Column(Text, nullable=True)
     post_type = Column(String, nullable=False, server_default=text("'text'"))  # text | image | video | link

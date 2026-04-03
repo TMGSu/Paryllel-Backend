@@ -21,6 +21,7 @@ class User(Base):
     total_earned = Column(Numeric(10, 2), nullable=False, server_default=text("0"))
 
     is_verified = Column(Boolean, nullable=False, server_default=text("false"))
+    show_nsfw = Column(Boolean, nullable=False, server_default=text("false"))
     is_banned = Column(Boolean, nullable=False, server_default=text("false"))
 
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("NOW()"))

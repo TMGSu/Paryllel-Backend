@@ -8,6 +8,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes import all_routers
 from app.core.database import engine  # ✅ use shared engine
+from app.models.community_tag import CommunityTag  # noqa: F401 — registers mapper
+from app.models.community_category import CommunityCategory  # noqa: F401
+from app.models.community_join_request import CommunityJoinRequest  # noqa: F401
 
 load_dotenv()
 

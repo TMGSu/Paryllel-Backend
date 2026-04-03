@@ -45,6 +45,7 @@ class CreatePost(BaseModel):
     community_name: str
     post_type: str = "text"  # text | image | video | link | poll
     tag: Optional[str] = None
+    tag_id: Optional[str] = None
     is_nsfw: bool = False
     subscriber_only: bool = False
     link_url: Optional[str] = None
@@ -69,6 +70,7 @@ def format_post(post: Post, current_user_id=None, db: Session = None):
         "tip_count": post.tip_count,
         "total_tips": post.total_tips,
         "subscriber_only": post.subscriber_only,
+        "tag": {"id": str(post.tag.id), "name": post.tag.name, "color": post.tag.color} if post.tag else None,
         "created_at": post.created_at.isoformat() if post.created_at else None,
         "updated_at": post.updated_at.isoformat() if post.updated_at else None,
         "author": {
@@ -235,14 +237,15 @@ def create_post(
             raise HTTPException(status_code=403, detail="Only mods/owners can create subscriber-only posts")
 
     post = Post(
-        author_id=user.id,
-        community_id=community.id,
-        title=body.title.strip(),
-        body=body.body,
-        post_type=body.post_type,
-        is_nsfw=body.is_nsfw,
-        subscriber_only=body.subscriber_only,
-    )
+    author_id=user.id,
+    community_id=community.id,
+    title=body.title.strip(),
+    body=body.body,
+    post_type=body.post_type,
+    is_nsfw=body.is_nsfw,
+    subscriber_only=body.subscriber_only,
+    tag_id=body.tag_id or None,
+)
     db.add(post)
     db.flush()
 

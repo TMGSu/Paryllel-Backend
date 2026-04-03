@@ -136,13 +136,21 @@ def mod_overview(
         CommunityRule.community_id == community.id,
     ).scalar() or 0
 
+    join_request_count = 0
+    if community.is_private:
+        from app.models.community_join_request import CommunityJoinRequest
+        join_request_count = db.query(func.count(CommunityJoinRequest.id)).filter(
+            CommunityJoinRequest.community_id == community.id,
+            CommunityJoinRequest.status == "pending",
+        ).scalar() or 0
+
     return {
         "community": {
             "id": str(community.id),
             "name": community.name,
             "display_name": community.display_name,
             "description": community.description,
-            "category": community.category if hasattr(community, "category") else None,
+            "category": community.category,
             "icon_url": community.icon_url,
             "banner_url": community.banner_url,
             "member_count": member_count,
@@ -156,6 +164,7 @@ def mod_overview(
             "pending_reports": pending_reports,
             "ban_count": ban_count,
             "rule_count": rule_count,
+            "join_request_count": join_request_count,
         },
     }
 
@@ -179,7 +188,7 @@ def update_community_settings(
         community.display_name = body.display_name
     if body.description is not None:
         community.description = body.description
-    if body.category is not None and hasattr(community, "category"):
+    if body.category is not None:
         community.category = body.category
     if body.icon_url is not None:
         community.icon_url = body.icon_url
@@ -580,3 +589,254 @@ def report_post(
     db.add(report)
     db.commit()
     return {"message": "Post reported"}
+
+@router.get("/{name}/subscribers")
+def get_community_subscribers(
+    name: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    from app.models.community import Community
+    from app.models.community_member import CommunityMember
+    from app.models.community_subscription import CommunitySubscription
+    from datetime import datetime, timezone
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    # Must be a mod
+    mod_check = db.query(CommunityMember).filter(
+        CommunityMember.community_id == community.id,
+        CommunityMember.user_id == user.id,
+        CommunityMember.is_moderator == True,
+    ).first()
+    if not mod_check:
+        raise HTTPException(status_code=403, detail="Moderators only")
+
+    rows = (
+        db.query(CommunitySubscription, User)
+        .join(User, CommunitySubscription.subscriber_user_id == User.id)
+        .filter(CommunitySubscription.community_id == community.id)
+        .order_by(CommunitySubscription.created_at.desc())
+        .all()
+    )
+
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            "id": str(r.CommunitySubscription.id),
+            "username": r.User.username,
+            "display_name": r.User.display_name,
+            "avatar_url": r.User.avatar_url,
+            "status": r.CommunitySubscription.status,
+            "cancel_at_period_end": r.CommunitySubscription.cancel_at_period_end,
+            "current_period_end": r.CommunitySubscription.current_period_end.isoformat() if r.CommunitySubscription.current_period_end else None,
+            "subscribed_since": r.CommunitySubscription.created_at.isoformat() if r.CommunitySubscription.created_at else None,
+        }
+        for r in rows
+    ]
+
+@router.get("/{name}/join-requests")
+def list_join_requests(
+    name: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_join_request import CommunityJoinRequest
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    requests = (
+        db.query(CommunityJoinRequest, User)
+        .join(User, CommunityJoinRequest.user_id == User.id)
+        .filter(
+            CommunityJoinRequest.community_id == community.id,
+            CommunityJoinRequest.status == "pending",
+        )
+        .order_by(CommunityJoinRequest.created_at)
+        .all()
+    )
+
+    return {
+        "requests": [
+            {
+                "id": str(r.CommunityJoinRequest.id),
+                "user": fmt_user(r.User),
+                "created_at": r.CommunityJoinRequest.created_at.isoformat(),
+            }
+            for r in requests
+        ]
+    }
+
+
+@router.post("/{name}/join-requests/{request_id}/approve")
+def approve_join_request(
+    name: str,
+    request_id: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_join_request import CommunityJoinRequest
+    from datetime import datetime, timezone
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    req = db.query(CommunityJoinRequest).filter(
+        CommunityJoinRequest.id == request_id,
+        CommunityJoinRequest.community_id == community.id,
+        CommunityJoinRequest.status == "pending",
+    ).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req.status = "approved"
+    req.reviewed_by = user.id
+    req.reviewed_at = datetime.now(timezone.utc)
+
+    membership = CommunityMember(
+        user_id=req.user_id,
+        community_id=community.id,
+    )
+    db.add(membership)
+    community.member_count += 1
+    db.commit()
+    return {"message": "Request approved"}
+
+
+@router.post("/{name}/join-requests/{request_id}/reject")
+def reject_join_request(
+    name: str,
+    request_id: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_join_request import CommunityJoinRequest
+    from datetime import datetime, timezone
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    req = db.query(CommunityJoinRequest).filter(
+        CommunityJoinRequest.id == request_id,
+        CommunityJoinRequest.community_id == community.id,
+        CommunityJoinRequest.status == "pending",
+    ).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req.status = "rejected"
+    req.reviewed_by = user.id
+    req.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"message": "Request rejected"}
+
+# ── Pinned Posts ───────────────────────────────────────────────────────────────
+
+@router.post("/{name}/posts/{post_id}/pin")
+def pin_post(
+    name: str,
+    post_id: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    post = db.query(Post).filter(
+        Post.id == post_id,
+        Post.community_id == community.id,
+        Post.is_removed == False,
+    ).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    # Unpin any currently pinned post first — only one pinned post at a time
+    db.query(Post).filter(
+        Post.community_id == community.id,
+        Post.is_pinned == True,
+    ).update({"is_pinned": False})
+
+    post.is_pinned = True
+    db.commit()
+    return {"message": "Post pinned"}
+
+
+@router.delete("/{name}/posts/{post_id}/pin")
+def unpin_post(
+    name: str,
+    post_id: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    post = db.query(Post).filter(
+        Post.id == post_id,
+        Post.community_id == community.id,
+    ).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    post.is_pinned = False
+    db.commit()
+    return {"message": "Post unpinned"}
+
+# ── Member Removal ─────────────────────────────────────────────────────────────
+
+@router.delete("/{name}/members/{username}")
+def remove_member(
+    name: str,
+    username: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+    user = get_authed_user(clerk_user_id, db)
+    community = get_community_or_404(name, db)
+    require_mod(user, community, db)
+
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if str(target.id) == str(user.id):
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
+
+    membership = db.query(CommunityMember).filter(
+        CommunityMember.community_id == community.id,
+        CommunityMember.user_id == target.id,
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="User is not a member")
+
+    if membership.is_moderator:
+        raise HTTPException(status_code=400, detail="Demote from mod first before removing")
+
+    db.delete(membership)
+    community.member_count = max(0, community.member_count - 1)
+    db.commit()
+    return {"message": f"u/{username} removed from community"}

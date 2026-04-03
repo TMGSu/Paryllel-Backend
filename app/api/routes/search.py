@@ -89,7 +89,6 @@ def search_communities(
     results = (
         db.query(Community)
         .filter(
-            Community.is_private == False,
             or_(
                 func.lower(Community.name).contains(term),
                 func.lower(Community.display_name).contains(term),
@@ -257,7 +256,6 @@ def global_search(
     communities = (
         db.query(Community)
         .filter(
-            Community.is_private == False,
             or_(
                 func.lower(Community.name).contains(term),
                 func.lower(Community.display_name).contains(term),

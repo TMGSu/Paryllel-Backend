@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel
@@ -11,6 +11,7 @@ from app.models.community_member import CommunityMember
 from app.models.community_rule import CommunityRule
 from app.models.user import User
 from app.models.post import Post
+from app.models.community_tag import CommunityTag
 from app.models.community_subscription_plan import CommunitySubscriptionPlan
 from app.models.community_subscription import CommunitySubscription
 from app.services import subscription_service
@@ -82,7 +83,6 @@ def format_moderator(user: User):
 def list_communities(db: Session = Depends(get_db)):
     communities = (
         db.query(Community)
-        .filter(Community.is_private == False)
         .order_by(Community.member_count.desc())
         .limit(50)
         .all()
@@ -126,8 +126,7 @@ def create_community(
         created_by=user.id,
         member_count=1,
     )
-    if hasattr(community, "category"):
-        community.category = body.category
+    community.category = body.category
 
     db.add(community)
     db.flush()
@@ -296,6 +295,46 @@ def list_moderators(name: str, db: Session = Depends(get_db)):
     )
     return {"moderators": [format_moderator(u) for u in mods]}
 
+# ── Members ─────────────────────────────────────────────────────────────────
+
+
+@router.get("/{name}/membership")
+def get_membership_status(
+    name: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    community = db.query(Community).filter(Community.name == name).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    membership = db.query(CommunityMember).filter(
+        CommunityMember.user_id == user.id,
+        CommunityMember.community_id == community.id,
+    ).first()
+
+    pending_request = None
+    if not membership and community.is_private:
+        from app.models.community_join_request import CommunityJoinRequest
+        pending_request = db.query(CommunityJoinRequest).filter(
+            CommunityJoinRequest.community_id == community.id,
+            CommunityJoinRequest.user_id == user.id,
+            CommunityJoinRequest.status == "pending",
+        ).first()
+
+    return {
+        "is_member": membership is not None,
+        "is_moderator": membership.is_moderator if membership else False,
+        "join_request_pending": pending_request is not None,
+    }
+
 
 # ── Join / Leave ───────────────────────────────────────────────────────────────
 
@@ -305,6 +344,7 @@ def join_community(
     payload: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
+    from app.models.community_join_request import CommunityJoinRequest
     clerk_user_id = payload["sub"]
     get_db_with_clerk_id(clerk_user_id, db)
 
@@ -320,11 +360,40 @@ def join_community(
     if existing:
         raise HTTPException(status_code=400, detail="Already a member")
 
+    # Private community — create a join request instead
+    if community.is_private:
+        existing_request = db.query(CommunityJoinRequest).filter(
+            CommunityJoinRequest.community_id == community.id,
+            CommunityJoinRequest.user_id == user.id,
+        ).first()
+
+        if existing_request:
+            if existing_request.status == "pending":
+                raise HTTPException(status_code=400, detail="Join request already pending")
+            elif existing_request.status == "rejected":
+                # Allow re-application by resetting the existing request
+                from datetime import datetime, timezone
+                existing_request.status = "pending"
+                existing_request.created_at = datetime.now(timezone.utc)
+                existing_request.reviewed_at = None
+                existing_request.reviewed_by = None
+                db.commit()
+                return {"message": "Join request sent", "status": "pending"}
+
+        request = CommunityJoinRequest(
+            community_id=community.id,
+            user_id=user.id,
+        )
+        db.add(request)
+        db.commit()
+        return {"message": "Join request sent", "status": "pending"}
+
+    # Public community — join immediately
     membership = CommunityMember(user_id=user.id, community_id=community.id)
     db.add(membership)
     community.member_count += 1
     db.commit()
-    return {"message": "Joined community"}
+    return {"message": "Joined community", "status": "joined"}
 
 
 @router.delete("/{name}/leave")
@@ -529,4 +598,157 @@ def subscription_status(
         "is_subscribed":          is_sub,
         "status":                 sub.status if sub else None,
         "current_period_end":     sub.current_period_end.isoformat() if sub else None,
+    }
+    
+# ── Community Tags ─────────────────────────────────────────────────────────────
+
+class CreateTag(BaseModel):
+    name: str
+    color: Optional[str] = None
+
+@router.get("/{name}/tags")
+def list_tags(name: str, db: Session = Depends(get_db)):
+    from app.models.community_tag import CommunityTag
+    c = db.query(Community).filter(Community.name == name).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Community not found")
+    tags = db.query(CommunityTag).filter(CommunityTag.community_id == c.id).order_by(CommunityTag.name).all()
+    return {"tags": [{"id": str(t.id), "name": t.name, "color": t.color} for t in tags]}
+
+
+@router.post("/{name}/tags")
+def create_tag(
+    name: str,
+    body: CreateTag,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_tag import CommunityTag
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    c = db.query(Community).filter(Community.name == name).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    mod = db.query(CommunityMember).filter(
+        CommunityMember.user_id == user.id,
+        CommunityMember.community_id == c.id,
+        CommunityMember.is_moderator == True,
+    ).first()
+    if not mod:
+        raise HTTPException(status_code=403, detail="Only moderators can manage tags")
+
+    tag_name = body.name.strip()[:50]
+    if not tag_name:
+        raise HTTPException(status_code=400, detail="Tag name required")
+
+    existing = db.query(CommunityTag).filter(
+        CommunityTag.community_id == c.id,
+        CommunityTag.name == tag_name,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Tag already exists")
+
+    tag = CommunityTag(community_id=c.id, name=tag_name, color=body.color)
+    db.add(tag)
+    db.commit()
+    db.refresh(tag)
+    return {"id": str(tag.id), "name": tag.name, "color": tag.color}
+
+
+@router.delete("/{name}/tags/{tag_id}")
+def delete_tag(
+    name: str,
+    tag_id: str,
+    payload: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_tag import CommunityTag
+    clerk_user_id = payload["sub"]
+    get_db_with_clerk_id(clerk_user_id, db)
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    c = db.query(Community).filter(Community.name == name).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    mod = db.query(CommunityMember).filter(
+        CommunityMember.user_id == user.id,
+        CommunityMember.community_id == c.id,
+        CommunityMember.is_moderator == True,
+    ).first()
+    if not mod:
+        raise HTTPException(status_code=403, detail="Only moderators can manage tags")
+
+    tag = db.query(CommunityTag).filter(
+        CommunityTag.id == tag_id,
+        CommunityTag.community_id == c.id,
+    ).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+
+    db.delete(tag)
+    db.commit()
+    return {"message": "Tag deleted"}
+
+@router.get("/categories/browse")
+def browse_categories(db: Session = Depends(get_db)):
+    from app.models.community_category import CommunityCategory
+    from sqlalchemy import func
+
+    categories = db.query(CommunityCategory).order_by(CommunityCategory.name).all()
+
+    # Count communities per category
+    counts = dict(
+        db.query(Community.category, func.count(Community.id))
+        .filter(Community.is_private == False, Community.category.isnot(None))
+        .group_by(Community.category)
+        .all()
+    )
+
+    return {
+        "categories": [
+            {
+                "id": str(c.id),
+                "name": c.name,
+                "slug": c.slug,
+                "icon": c.icon,
+                "community_count": counts.get(c.name, 0),
+            }
+            for c in categories
+        ]
+    }
+
+
+@router.get("/categories/{slug}/communities")
+def communities_by_category(
+    slug: str,
+    limit: int = Query(20, le=50),
+    offset: int = Query(0),
+    db: Session = Depends(get_db),
+):
+    from app.models.community_category import CommunityCategory
+
+    category = db.query(CommunityCategory).filter(CommunityCategory.slug == slug).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    communities = (
+        db.query(Community)
+        .filter(
+            Community.category == category.name,
+            Community.is_private == False,
+        )
+        .order_by(Community.member_count.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "category": {"name": category.name, "slug": category.slug, "icon": category.icon},
+        "communities": [format_community(c) for c in communities],
+        "count": len(communities),
     }

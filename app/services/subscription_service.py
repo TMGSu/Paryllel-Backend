@@ -382,7 +382,15 @@ def on_invoice_payment_succeeded(invoice: dict, db: Session) -> None:
         record.status = "active"
 
     # Sync period end from invoice if available
-    period_end = invoice.get("period_end") or invoice.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
+    # Prefer subscription-level period end from the invoice lines
+    lines = invoice.get("lines", {}).get("data", [])
+    period_end = None
+    for line in lines:
+        if line.get("type") == "subscription":
+            period_end = line.get("period", {}).get("end")
+            break
+    if not period_end:
+        period_end = invoice.get("period_end")
     if period_end:
         record.current_period_end = datetime.fromtimestamp(period_end, tz=timezone.utc)
 

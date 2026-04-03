@@ -10,6 +10,10 @@ from app.api.routes.admin import router as admin_router
 from app.api.routes.tips import router as tips_router
 from app.api.routes.webhook import router as stripe_webhook_router
 from app.api.routes.payouts import router as payouts_router
+from app.api.routes.feeds.home import router as home_feed_router
+from app.api.routes.feeds.community import router as community_feed_router
+from app.api.routes.feeds.popular import router as popular_feed_router
+from app.api.routes.feeds.explore import router as explore_feed_router
 
 
 all_routers = [
@@ -25,4 +29,8 @@ all_routers = [
     tips_router,
     payouts_router,
     stripe_webhook_router,
+    home_feed_router,
+    community_feed_router,
+    popular_feed_router,
+    explore_feed_router,
 ]
