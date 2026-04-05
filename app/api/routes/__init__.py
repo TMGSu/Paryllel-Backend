@@ -14,6 +14,7 @@ from app.api.routes.feeds.home import router as home_feed_router
 from app.api.routes.feeds.community import router as community_feed_router
 from app.api.routes.feeds.popular import router as popular_feed_router
 from app.api.routes.feeds.explore import router as explore_feed_router
+from app.api.routes.notifications import router as notifications_router
 
 
 all_routers = [
@@ -33,4 +34,5 @@ all_routers = [
     community_feed_router,
     popular_feed_router,
     explore_feed_router,
+    notifications_router,
 ]

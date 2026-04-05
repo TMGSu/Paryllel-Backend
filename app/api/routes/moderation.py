@@ -269,6 +269,15 @@ def invite_mod(
         db.add(membership)
         community.member_count += 1
 
+    from app.services.notification_service import create_notification
+    create_notification(
+        db,
+        user_id=str(target.id),
+        type="mod_invite",
+        title=f"You're now a moderator of p/{community.name}",
+        body="You have full mod access to this community.",
+        link=f"/p/{community.name}/mod",
+    )
     db.commit()
     return {"message": f"u/{body.username} is now a moderator"}
 
@@ -713,6 +722,16 @@ def approve_join_request(
     )
     db.add(membership)
     community.member_count += 1
+
+    from app.services.notification_service import create_notification
+    create_notification(
+        db,
+        user_id=str(req.user_id),
+        type="join_approved",
+        title=f"Your request to join p/{community.name} was approved",
+        body="You can now view and post in the community.",
+        link=f"/p/{community.name}",
+    )
     db.commit()
     return {"message": "Request approved"}
 
@@ -743,6 +762,16 @@ def reject_join_request(
     req.status = "rejected"
     req.reviewed_by = user.id
     req.reviewed_at = datetime.now(timezone.utc)
+
+    from app.services.notification_service import create_notification
+    create_notification(
+        db,
+        user_id=str(req.user_id),
+        type="join_rejected",
+        title=f"Your request to join p/{community.name} was not approved",
+        body=None,
+        link=f"/p/{community.name}",
+    )
     db.commit()
     return {"message": "Request rejected"}
 

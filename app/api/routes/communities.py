@@ -524,6 +524,17 @@ def subscribe(
         logger.exception("Stripe error during community subscribe")
         raise HTTPException(status_code=500, detail="Payment failed. Please try again.")
 
+    # Notify community owner
+    from app.services.notification_service import create_notification
+    if owner and str(subscriber.id) != str(owner.id):
+        create_notification(
+            db,
+            user_id=str(owner.id),
+            type="new_subscriber",
+            title=f"u/{subscriber.username} subscribed to p/{community.name}",
+            body=f"${plan.price_cents / 100:.2f}/month",
+            link=f"/p/{community.name}/mod",
+        )
     db.commit()
     return {
         "subscription_id":    str(sub.id),

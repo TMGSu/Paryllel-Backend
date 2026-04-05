@@ -86,6 +86,34 @@ def create_comment(
     db.commit()
     db.refresh(comment)
 
+    from app.services.notification_service import create_notification
+
+    # Notify post author of new comment (not if they comment on their own post)
+    if str(user.id) != str(post.author_id):
+        create_notification(
+            db,
+            user_id=str(post.author_id),
+            type="comment",
+            title=f"u/{user.username} commented on your post",
+            body=f"\"{post.title}\"",
+            link=f"/posts/{post.slug}",
+        )
+
+    # Notify parent comment author of reply (not if replying to own comment or post author already notified)
+    if body.parent_id:
+        parent = db.query(Comment).filter(Comment.id == body.parent_id).first()
+        if parent and str(parent.author_id) != str(user.id) and str(parent.author_id) != str(post.author_id):
+            create_notification(
+                db,
+                user_id=str(parent.author_id),
+                type="reply",
+                title=f"u/{user.username} replied to your comment",
+                body=f"on \"{post.title}\"",
+                link=f"/posts/{post.slug}",
+            )
+
+    db.commit()
+
     return {"message": "Comment created", "comment": format_comment(comment)}
 
 

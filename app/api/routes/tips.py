@@ -228,6 +228,19 @@ def send_tip(
     )
     db.commit()
 
+    # Notify post author
+    if str(tipper.id) != str(author.id):
+        from app.services.notification_service import create_notification
+        create_notification(
+            db,
+            user_id=str(author.id),
+            type="tip",
+            title=f"u/{tipper.username} tipped your post",
+            body=f"${fees.chosen_cents / 100:.2f} on \"{post.title}\"",
+            link=f"/posts/{post.slug}",
+        )
+        db.commit()
+
     return TipResponse(
         tip_id           = str(tip.id),
         status           = "processing",

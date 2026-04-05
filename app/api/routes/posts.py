@@ -398,5 +398,21 @@ def vote_post(
         else:
             post.downvotes += 1
 
+    # Milestone notifications for upvotes
+    if value == 1 and str(user.id) != str(post.author_id):
+        prev_upvotes = post.upvotes - 1
+        for milestone in [10, 50, 100, 500, 1000]:
+            if prev_upvotes < milestone <= post.upvotes:
+                from app.services.notification_service import create_notification
+                create_notification(
+                    db,
+                    user_id=str(post.author_id),
+                    type="milestone",
+                    title=f"Your post hit {milestone} upvotes 🔥",
+                    body=f"\"{post.title}\"",
+                    link=f"/posts/{post.slug}",
+                )
+                break
+
     db.commit()
     return {"message": "Vote recorded", "upvotes": post.upvotes, "downvotes": post.downvotes}
